@@ -565,7 +565,7 @@
     var letters = (text.match(/[A-Za-z]/g) || []).length;
     var caps = (text.match(/[A-Z]/g) || []).length;
     var capsRatio = letters ? caps / letters : 0;
-    var charFactor = 0.5 + 0.18 * capsRatio;
+    var charFactor = 0.55 + 0.17 * capsRatio;
     return (chars * charFactor + spaces * 0.25) * size;
   }
 
@@ -603,7 +603,9 @@
       var estW = estTextWidthPt(line.text, size);
       var w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estW * 1.15 + 6), pageWidth - x - 2, rightLimit - x));
       if (line.text.trim().indexOf(' ') === -1 && estW > w) {
-        size = Math.max(6, size * (w / estW) * 0.98);
+        /* Shrink with a safety margin: wide characters (w, m, @) render
+           wider than the average estimate, so aim for 90% of the box. */
+        size = Math.max(6, size * ((w * 0.9) / estW));
         estW = estTextWidthPt(line.text, size);
       }
       var wraps = Math.min(4, Math.max(1, Math.ceil(estW / Math.max(w, 20))));
