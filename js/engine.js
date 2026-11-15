@@ -71,6 +71,13 @@
         'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
       ],
       check: function () { return !!(global.Tesseract && global.Tesseract.createWorker); }
+    },
+    pptxgenjs: {
+      urls: [
+        'https://cdn.jsdelivr.net/npm/pptxgenjs@4.0.1/dist/pptxgen.bundle.js',
+        'https://unpkg.com/pptxgenjs@4.0.1/dist/pptxgen.bundle.js'
+      ],
+      check: function () { return !!global.PptxGenJS; }
     }
   };
   var loadedLibs = {};
@@ -544,6 +551,24 @@
      positioned text box at its original PDF coordinates, on a page of
      the PDF's own size, with its font size, bold/italic and font kept.
      Text stays fully editable — each box holds real text, not an image. */
+  /* Letter-spaced headings (common in CV templates: "C O N T A C T") store
+     their spacing as glyph positions, not characters, so the extracted
+     text looks joined in Word/PowerPoint. When a line's span is much
+     wider than its text, return the extra spacing per character (points)
+     so it can be rendered spread out the way it looked in the PDF. */
+  function letterSpacingPts(line) {
+    var chars = line.text.replace(/ /g, '').length;
+    var spaces = line.text.length - chars;
+    var letters = (line.text.match(/[A-Za-z]/g) || []).length;
+    var caps = (line.text.match(/[A-Z]/g) || []).length;
+    var capsRatio = letters ? caps / letters : 0;
+    var charFactor = 0.5 + 0.18 * capsRatio; /* capitals are wider */
+    var expected = (chars * charFactor + spaces * 0.25) * line.size;
+    if (chars < 3 || line.w <= expected * 1.25) return 0;
+    var gaps = Math.max(1, line.text.length - 1);
+    return Math.min(8, Math.max(0, (line.w - expected) / gaps));
+  }
+
   function buildLayoutDocxXml(pages) {
     var shapeId = 0;
     var parts = [];
@@ -551,23 +576,7 @@
     pages.forEach(function (pg, pi) {
       pg.lines.forEach(function (line) {
         shapeId++;
-        /* Letter-spaced headings (common in CV templates: "C O N T A C T")
-           store their spacing as glyph positions, not characters, so the
-           extracted text looks joined in Word. When a line's span is much
-           wider than its text, spread the letters with character spacing
-           so it looks the way it did in the PDF. */
-        var chars = line.text.replace(/ /g, '').length;
-        var spaces = line.text.length - chars;
-        var letters = (line.text.match(/[A-Za-z]/g) || []).length;
-        var caps = (line.text.match(/[A-Z]/g) || []).length;
-        var capsRatio = letters ? caps / letters : 0;
-        var charFactor = 0.5 + 0.18 * capsRatio; /* capitals are wider */
-        var expected = (chars * charFactor + spaces * 0.25) * line.size;
-        var spacingTwips = 0;
-        if (chars >= 3 && line.w > expected * 1.25) {
-          var gaps = Math.max(1, line.text.length - 1);
-          spacingTwips = Math.min(160, Math.max(0, Math.round((line.w - expected) / gaps * 20)));
-        }
+        var spacingTwips = Math.round(letterSpacingPts(line) * 20);
         var x = Math.max(0, Math.min(line.x, pg.width - 20)).toFixed(1);
         var y = Math.max(0, line.y).toFixed(1);
         /* Generous box: font substitution in Word can render text wider
@@ -1006,6 +1015,87 @@
     return { files: [{ name: baseOf(file.name) + '.docx', blob: blob }] };
   }
 
+  /* PDF to PowerPoint. A presentation has one slide size, so the first
+     page's size is used for every slide (nearly all PDFs use one size).
+     Editable-text mode: every line becomes a text box at its original
+     position, size and styling — fully editable. Page-image mode: each
+     page is rendered as a picture that fills the slide — pixel-perfect,
+     but not editable. */
+  async function toolPdfToPptx(files, opts, prog) {
+    needLib('pptxgenjs');
+    var file = files[0]; assertSize(file);
+    var mode = (opts && opts.slideContent) || 'text';
+    var pptx = new global.PptxGenJS();
+    pptx.author = 'TrustFile';
+    pptx.title = baseOf(file.name);
+    if (mode === 'image') {
+      var pdf = await loadPdfJs(file);
+      var firstVp = null;
+      for (var p = 1; p <= pdf.numPages; p++) {
+        var page = await pdf.getPage(p);
+        var vp1 = page.getViewport({ scale: 1 });
+        if (!firstVp) {
+          firstVp = vp1;
+          pptx.defineLayout({ name: 'PDF', width: vp1.width / 72, height: vp1.height / 72 });
+          pptx.layout = 'PDF';
+        }
+        var scale = 2;
+        var viewport = page.getViewport({ scale: scale });
+        var canvas = document.createElement('canvas');
+        canvas.width = viewport.width; canvas.height = viewport.height;
+        var ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+        var slide = pptx.addSlide();
+        slide.addImage({ data: canvas.toDataURL('image/png'), x: 0, y: 0, w: firstVp.width / 72, h: firstVp.height / 72, sizingType: 'cover' });
+        prog(p / pdf.numPages * 0.9, 'Rendering page ' + p + ' of ' + pdf.numPages + '...');
+      }
+    } else {
+      var layout = await pdfPages(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
+      var slidePages = layout.pages.map(function (pg) {
+        var lines = pg.boxes.length ? layoutLinesFromBoxes(pg.boxes, pg.isOcr) : [];
+        if (!lines.length && pg.fallbackLines.length) {
+          lines = pg.fallbackLines.map(function (t, i) {
+            return { text: t, x: 36, y: 36 + i * 18, w: pg.width - 72, size: 11, bold: false, italic: false, font: '' };
+          });
+        }
+        return { width: pg.width, height: pg.height, lines: lines };
+      });
+      if (!slidePages.some(function (pg) { return pg.lines.length; })) {
+        throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
+      }
+      var first = slidePages[0];
+      pptx.defineLayout({ name: 'PDF', width: first.width / 72, height: first.height / 72 });
+      pptx.layout = 'PDF';
+      slidePages.forEach(function (pg, idx) {
+        var s = pptx.addSlide();
+        pg.lines.forEach(function (line) {
+          var spacing = letterSpacingPts(line);
+          var box = {
+            x: Math.max(0, line.x) / 72,
+            y: Math.max(0, line.y) / 72,
+            w: Math.max(0.15, (line.w * 1.2 + 12) / 72),
+            h: (line.size * 1.5) / 72,
+            fontSize: Math.max(6, line.size),
+            bold: !!line.bold,
+            italic: !!line.italic,
+            color: '000000',
+            valign: 'top',
+            wrap: false,
+            margin: 0
+          };
+          if (line.font) box.fontFace = line.font;
+          if (spacing > 0) box.charSpacing = Math.round(spacing * 10) / 10;
+          s.addText(line.text, box);
+        });
+        prog(0.8 + (idx + 1) / slidePages.length * 0.1, 'Building slide ' + (idx + 1) + ' of ' + slidePages.length + '...');
+      });
+    }
+    prog(0.95, 'Building the PowerPoint file...');
+    var outBlob = await pptx.write({ outputType: 'blob' });
+    return { files: [{ name: baseOf(file.name) + '.pptx', blob: outBlob }] };
+  }
+
   async function toolPdfToImages(files, opts, prog, format) {
     var file = files[0]; assertSize(file);
     var scale = parseFloat(opts.scale || '2') || 2;
@@ -1265,6 +1355,393 @@
     return { files: [{ name: baseOf(file.name) + '-' + newW + 'x' + newH + '.' + target, blob: blob }] };
   }
 
+  /* ---------------- PowerPoint reading (PPTX -> PDF) ----------------
+     A .pptx file is a zip of XML. We read each slide's shapes — text
+     boxes, pictures and solid fills — with their original positions and
+     styling, and redraw them on PDF pages of the same size. Charts,
+     tables, SmartArt and effects need a full presentation renderer, so
+     they are skipped honestly (counted in the result note). */
+  var EMU_PER_PT = 12700;
+  var REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+  function xmlDoc(text) {
+    return new global.DOMParser().parseFromString(text, 'text/xml');
+  }
+  function localNameOf(node) {
+    if (node.localName) return node.localName;
+    return String(node.nodeName || '').split(':').pop();
+  }
+  function elChildren(el, local) {
+    var out = [];
+    var kids = el.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].nodeType === 1 && localNameOf(kids[i]) === local) out.push(kids[i]);
+    }
+    return out;
+  }
+  function elChild(el, local) {
+    var c = elChildren(el, local);
+    return c.length ? c[0] : null;
+  }
+  function elDescendants(el, local, out) {
+    out = out || [];
+    var kids = el.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].nodeType !== 1) continue;
+      if (localNameOf(kids[i]) === local) out.push(kids[i]);
+      elDescendants(kids[i], local, out);
+    }
+    return out;
+  }
+  function relAttr(el, name) {
+    if (el.getAttributeNS) {
+      var v = null;
+      try { v = el.getAttributeNS(REL_NS, name); } catch (e) { v = null; }
+      if (v) return v;
+    }
+    return el.getAttribute('r:' + name);
+  }
+  function parseRels(xmlText) {
+    var doc = xmlDoc(xmlText);
+    var map = {};
+    elDescendants(doc.documentElement, 'Relationship').forEach(function (r) {
+      map[r.getAttribute('Id')] = r.getAttribute('Target');
+    });
+    return map;
+  }
+  function resolveTarget(baseDir, target) {
+    var parts = baseDir ? baseDir.split('/') : [];
+    target.split('/').forEach(function (seg) {
+      if (seg === '..') parts.pop();
+      else if (seg !== '.' && seg !== '') parts.push(seg);
+    });
+    return parts.join('/');
+  }
+  function solidFillColor(parentEl) {
+    var fill = parentEl && elChild(parentEl, 'solidFill');
+    if (!fill) return null;
+    var clr = elChild(fill, 'srgbClr');
+    if (clr) {
+      var v = String(clr.getAttribute('val') || '');
+      if (/^[0-9a-fA-F]{6}$/.test(v)) {
+        return { r: parseInt(v.substr(0, 2), 16), g: parseInt(v.substr(2, 2), 16), b: parseInt(v.substr(4, 2), 16) };
+      }
+      return null;
+    }
+    var scheme = elChild(fill, 'schemeClr');
+    if (scheme) {
+      var map = { dk1: '000000', lt1: 'FFFFFF', dk2: '1F497D', lt2: 'EEECE1', accent1: '4F81BD', accent2: 'C0504D', accent3: '9BBB59', accent4: '8064A2', accent5: '4BACC6', accent6: 'F79646', hlink: '0563C1', folHlink: '954F72', bg1: 'FFFFFF', tx1: '000000', bg2: 'EEECE1', tx2: '1F497D' };
+      var hex = map[scheme.getAttribute('val')];
+      if (hex) return { r: parseInt(hex.substr(0, 2), 16), g: parseInt(hex.substr(2, 2), 16), b: parseInt(hex.substr(4, 2), 16) };
+    }
+    return null;
+  }
+  function shapeBox(spPr, tf) {
+    var xfrm = spPr && elChild(spPr, 'xfrm');
+    var off = xfrm && elChild(xfrm, 'off');
+    var ext = xfrm && elChild(xfrm, 'ext');
+    if (!off || !ext) return null;
+    var x = parseFloat(off.getAttribute('x')) / EMU_PER_PT;
+    var y = parseFloat(off.getAttribute('y')) / EMU_PER_PT;
+    var w = parseFloat(ext.getAttribute('cx')) / EMU_PER_PT;
+    var h = parseFloat(ext.getAttribute('cy')) / EMU_PER_PT;
+    return { x: tf.dx + x * tf.sx, y: tf.dy + y * tf.sy, w: w * tf.sx, h: h * tf.sy };
+  }
+  function runStyle(rPr, text) {
+    var style = { text: text, size: 18, bold: false, italic: false, color: null, font: '' };
+    if (rPr) {
+      if (rPr.getAttribute('sz')) style.size = Math.max(4, parseInt(rPr.getAttribute('sz'), 10) / 100);
+      if (rPr.getAttribute('b') === '1') style.bold = true;
+      if (rPr.getAttribute('i') === '1') style.italic = true;
+      style.color = solidFillColor(rPr);
+      var latin = elChild(rPr, 'latin');
+      if (latin && latin.getAttribute('typeface')) style.font = latin.getAttribute('typeface');
+    }
+    return style;
+  }
+  function parseSlideParagraph(pEl) {
+    var pPr = elChild(pEl, 'pPr');
+    var algn = pPr && pPr.getAttribute('algn');
+    var defRPr = pPr && elChild(pPr, 'defRPr');
+    var runs = [];
+    var kids = pEl.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (k.nodeType !== 1) continue;
+      var ln = localNameOf(k);
+      if (ln === 'r' || ln === 'fld') {
+        var tEl = elChild(k, 't');
+        var text = tEl ? (tEl.textContent || '') : '';
+        if (text) runs.push(runStyle(elChild(k, 'rPr') || defRPr, text));
+      } else if (ln === 'br') {
+        runs.push({ br: true });
+      }
+    }
+    return { align: algn === 'ctr' ? 'center' : (algn === 'r' ? 'right' : 'left'), runs: runs };
+  }
+  function parseTextShape(el, tf) {
+    var spPr = elChild(el, 'spPr');
+    var box = shapeBox(spPr, tf) || { x: 0, y: 0, w: 100, h: 50 };
+    var fill = spPr ? solidFillColor(spPr) : null;
+    if (spPr && elChild(spPr, 'noFill')) fill = null;
+    var txBody = elChild(el, 'txBody');
+    var paras = [];
+    var anchor = 't', wrap = true;
+    var insets = { l: 91440 / EMU_PER_PT, t: 45720 / EMU_PER_PT, r: 91440 / EMU_PER_PT, b: 45720 / EMU_PER_PT };
+    if (txBody) {
+      var bodyPr = elChild(txBody, 'bodyPr');
+      if (bodyPr) {
+        if (bodyPr.getAttribute('anchor')) anchor = bodyPr.getAttribute('anchor');
+        if (bodyPr.getAttribute('wrap') === 'none') wrap = false;
+        ['lIns', 'tIns', 'rIns', 'bIns'].forEach(function (a, idx) {
+          var v = bodyPr.getAttribute(a);
+          if (v !== null && v !== '') insets[['l', 't', 'r', 'b'][idx]] = parseFloat(v) / EMU_PER_PT;
+        });
+      }
+      elChildren(txBody, 'p').forEach(function (pEl) { paras.push(parseSlideParagraph(pEl)); });
+    }
+    return { kind: 'text', box: box, fill: fill, paras: paras, anchor: anchor, wrap: wrap, insets: insets };
+  }
+  function parsePicShape(el, tf, rels, dir) {
+    var spPr = elChild(el, 'spPr');
+    var box = shapeBox(spPr, tf) || { x: 0, y: 0, w: 100, h: 100 };
+    var blipFill = elChild(el, 'blipFill');
+    var blip = blipFill && elChild(blipFill, 'blip');
+    var mediaPath = null;
+    if (blip) {
+      var target = rels[relAttr(blip, 'embed')];
+      if (target) mediaPath = resolveTarget(dir, target);
+    }
+    return { kind: 'pic', box: box, mediaPath: mediaPath };
+  }
+  function walkSlideShapes(container, tf, out, rels, dir) {
+    var kids = container.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      var el = kids[i];
+      if (el.nodeType !== 1) continue;
+      var ln = localNameOf(el);
+      if (ln === 'grpSp') {
+        var ntf = tf;
+        var grpPr = elChild(el, 'grpSpPr');
+        var xfrm = grpPr && elChild(grpPr, 'xfrm');
+        var off = xfrm && elChild(xfrm, 'off'), ext = xfrm && elChild(xfrm, 'ext');
+        var chOff = xfrm && elChild(xfrm, 'chOff'), chExt = xfrm && elChild(xfrm, 'chExt');
+        if (off && ext && chOff && chExt) {
+          var sx = parseFloat(ext.getAttribute('cx')) / parseFloat(chExt.getAttribute('cx'));
+          var sy = parseFloat(ext.getAttribute('cy')) / parseFloat(chExt.getAttribute('cy'));
+          var ox = parseFloat(off.getAttribute('x')) / EMU_PER_PT, oy = parseFloat(off.getAttribute('y')) / EMU_PER_PT;
+          var cx = parseFloat(chOff.getAttribute('x')) / EMU_PER_PT, cy = parseFloat(chOff.getAttribute('y')) / EMU_PER_PT;
+          ntf = { dx: tf.dx + (ox - cx * sx) * tf.sx, dy: tf.dy + (oy - cy * sy) * tf.sy, sx: tf.sx * sx, sy: tf.sy * sy };
+        }
+        walkSlideShapes(el, ntf, out, rels, dir);
+      } else if (ln === 'sp') {
+        out.push(parseTextShape(el, tf));
+      } else if (ln === 'pic') {
+        out.push(parsePicShape(el, tf, rels, dir));
+      } else if (ln === 'graphicFrame') {
+        out.push({ kind: 'unsupported' });
+      }
+    }
+  }
+  function parseSlideDoc(doc, rels, dir) {
+    var root = doc.documentElement;
+    var cSld = elChild(root, 'cSld');
+    var bg = null;
+    var bgEl = cSld && elChild(cSld, 'bg');
+    if (bgEl) bg = solidFillColor(elChild(bgEl, 'bgPr'));
+    var shapes = [];
+    var spTree = cSld && elChild(cSld, 'spTree');
+    if (spTree) walkSlideShapes(spTree, { dx: 0, dy: 0, sx: 1, sy: 1 }, shapes, rels, dir);
+    return { bg: bg, shapes: shapes };
+  }
+  async function parsePptx(zip, prog) {
+    var presXml = await zip.file('ppt/presentation.xml').async('text');
+    var presDoc = xmlDoc(presXml);
+    var sldSz = elDescendants(presDoc.documentElement, 'sldSz')[0];
+    var slideW = sldSz ? parseFloat(sldSz.getAttribute('cx')) / EMU_PER_PT : 960;
+    var slideH = sldSz ? parseFloat(sldSz.getAttribute('cy')) / EMU_PER_PT : 540;
+    var presRels = {};
+    if (zip.file('ppt/_rels/presentation.xml.rels')) {
+      presRels = parseRels(await zip.file('ppt/_rels/presentation.xml.rels').async('text'));
+    }
+    var order = [];
+    elDescendants(presDoc.documentElement, 'sldId').forEach(function (idEl) {
+      var target = presRels[relAttr(idEl, 'id')];
+      if (target) order.push(resolveTarget('ppt', target));
+    });
+    if (!order.length) {
+      var names = Object.keys(zip.files).filter(function (n) { return /^ppt\/slides\/slide\d+\.xml$/.test(n); });
+      names.sort(function (a, b) { return parseInt(a.match(/(\d+)\.xml$/)[1], 10) - parseInt(b.match(/(\d+)\.xml$/)[1], 10); });
+      order = names;
+    }
+    var slides = [];
+    var skipped = 0;
+    for (var i = 0; i < order.length; i++) {
+      var path = order[i];
+      var file = zip.file(path);
+      if (!file) continue;
+      var dir = path.split('/').slice(0, -1).join('/');
+      var slideRels = {};
+      var relsPath = dir + '/_rels/' + path.split('/').pop() + '.rels';
+      if (zip.file(relsPath)) slideRels = parseRels(await zip.file(relsPath).async('text'));
+      var slide = parseSlideDoc(xmlDoc(await file.async('text')), slideRels, dir);
+      for (var j = 0; j < slide.shapes.length; j++) {
+        var sh = slide.shapes[j];
+        if (sh.kind === 'unsupported') { skipped++; continue; }
+        if (sh.kind === 'pic' && sh.mediaPath) {
+          var media = zip.file(sh.mediaPath);
+          if (media) {
+            var ext = (sh.mediaPath.split('.').pop() || '').toLowerCase();
+            if (ext === 'jpg' || ext === 'jpeg' || ext === 'png') {
+              var b64 = await media.async('base64');
+              sh.dataUrl = 'data:image/' + (ext === 'png' ? 'png' : 'jpeg') + ';base64,' + b64;
+              sh.imgFormat = ext === 'png' ? 'PNG' : 'JPEG';
+            } else if (typeof document !== 'undefined') {
+              /* GIF/BMP/WebP: redraw through a canvas as PNG. */
+              try {
+                var bytes = await media.async('uint8array');
+                var blobUrl = URL.createObjectURL(new Blob([bytes]));
+                var img = await loadImage(blobUrl);
+                URL.revokeObjectURL(blobUrl);
+                var cv = document.createElement('canvas');
+                cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+                cv.getContext('2d').drawImage(img, 0, 0);
+                sh.dataUrl = cv.toDataURL('image/png');
+                sh.imgFormat = 'PNG';
+              } catch (e) { /* leave the picture out */ }
+            }
+          }
+        }
+      }
+      slides.push(slide);
+      if (prog) prog((i + 1) / order.length * 0.5, 'Reading slide ' + (i + 1) + ' of ' + order.length + '...');
+    }
+    return { width: slideW, height: slideH, slides: slides, skipped: skipped };
+  }
+  function jsPdfFontName(face) {
+    var f = String(face || '').toLowerCase();
+    if (/times|georgia|serif|garamond|cambria|palatino/.test(f)) return 'times';
+    if (/courier|mono|consolas|monaco|menlo/.test(f)) return 'courier';
+    return 'helvetica';
+  }
+  function setRunFont(doc, r) {
+    doc.setFont(jsPdfFontName(r.font), r.bold && r.italic ? 'bolditalic' : r.bold ? 'bold' : r.italic ? 'italic' : 'normal');
+    doc.setFontSize(r.size);
+  }
+  function maxRunSize(runs) {
+    var m = 18;
+    runs.forEach(function (r) { if (r.size > m) m = r.size; });
+    return m;
+  }
+  function wrapRuns(doc, seg, maxW, wrap, align, lines) {
+    if (!wrap || !seg.length) {
+      lines.push({ runs: seg, align: align, size: maxRunSize(seg) });
+      return;
+    }
+    var words = [];
+    seg.forEach(function (r) {
+      r.text.split(/(\s+)/).forEach(function (p) {
+        if (p !== '') words.push({ text: p, run: r });
+      });
+    });
+    var cur = [], curW = 0;
+    function flush() {
+      if (!cur.length) return;
+      var runs = [];
+      cur.forEach(function (wd) {
+        var last = runs[runs.length - 1];
+        if (last && last.src === wd.run) last.text += wd.text;
+        else runs.push({ text: wd.text, size: wd.run.size, bold: wd.run.bold, italic: wd.run.italic, color: wd.run.color, font: wd.run.font, src: wd.run });
+      });
+      runs.forEach(function (r) { delete r.src; });
+      lines.push({ runs: runs, align: align, size: maxRunSize(runs) });
+      cur = []; curW = 0;
+    }
+    words.forEach(function (wd) {
+      setRunFont(doc, wd.run);
+      var ww = doc.getTextWidth(wd.text);
+      if (cur.length && curW + ww > maxW && !/^\s+$/.test(wd.text)) flush();
+      if (/^\s+$/.test(wd.text) && !cur.length) return;
+      cur.push(wd); curW += ww;
+    });
+    flush();
+  }
+  function renderTextShape(doc, sh) {
+    var box = sh.box;
+    if (sh.fill) { doc.setFillColor(sh.fill.r, sh.fill.g, sh.fill.b); doc.rect(box.x, box.y, box.w, box.h, 'F'); }
+    var x0 = box.x + sh.insets.l, y0 = box.y + sh.insets.t;
+    var w = Math.max(10, box.w - sh.insets.l - sh.insets.r);
+    var h = Math.max(10, box.h - sh.insets.t - sh.insets.b);
+    var lines = [];
+    sh.paras.forEach(function (para) {
+      var segments = [[]];
+      para.runs.forEach(function (r) {
+        if (r.br) segments.push([]);
+        else segments[segments.length - 1].push(r);
+      });
+      segments.forEach(function (seg) {
+        if (!seg.length) { lines.push({ runs: [], align: para.align, size: 18 }); return; }
+        wrapRuns(doc, seg, w, sh.wrap, para.align, lines);
+      });
+    });
+    var totalH = 0;
+    lines.forEach(function (l) { totalH += l.size * 1.2; });
+    var y = y0;
+    if (sh.anchor === 'ctr') y = y0 + Math.max(0, (h - totalH) / 2);
+    else if (sh.anchor === 'b') y = y0 + Math.max(0, h - totalH);
+    lines.forEach(function (line) {
+      var baseline = y + line.size * 0.85;
+      var lineW = 0;
+      line.runs.forEach(function (r) { setRunFont(doc, r); lineW += doc.getTextWidth(r.text); });
+      var rx = x0;
+      if (line.align === 'center') rx = x0 + (w - lineW) / 2;
+      else if (line.align === 'right') rx = x0 + w - lineW;
+      line.runs.forEach(function (r) {
+        setRunFont(doc, r);
+        if (r.color) doc.setTextColor(r.color.r, r.color.g, r.color.b); else doc.setTextColor(0, 0, 0);
+        doc.text(r.text, rx, baseline);
+        rx += doc.getTextWidth(r.text);
+      });
+      y += line.size * 1.2;
+    });
+  }
+  async function toolPptxToPdf(files, opts, prog) {
+    needLib('jszip'); needLib('jspdf');
+    var file = files[0]; assertSize(file);
+    var zip = new global.JSZip();
+    await zip.loadAsync(await readArrayBuffer(file));
+    if (!zip.file('ppt/presentation.xml')) {
+      throw new Error('This does not look like a PowerPoint (.pptx) file. Only .pptx files are supported — older .ppt files need to be re-saved as .pptx first.');
+    }
+    var model = await parsePptx(zip, prog);
+    if (!model.slides.length) throw new Error('No slides were found in this presentation.');
+    var doc = null;
+    for (var i = 0; i < model.slides.length; i++) {
+      var slide = model.slides[i];
+      if (!doc) {
+        doc = new global.jspdf.jsPDF({ unit: 'pt', format: [model.width, model.height], orientation: model.width > model.height ? 'landscape' : 'portrait', compress: true });
+      } else {
+        doc.addPage([model.width, model.height], model.width > model.height ? 'landscape' : 'portrait');
+      }
+      if (slide.bg) { doc.setFillColor(slide.bg.r, slide.bg.g, slide.bg.b); doc.rect(0, 0, model.width, model.height, 'F'); }
+      slide.shapes.forEach(function (sh) {
+        if (sh.kind === 'text') renderTextShape(doc, sh);
+        else if (sh.kind === 'pic' && sh.dataUrl) {
+          try { doc.addImage(sh.dataUrl, sh.imgFormat, sh.box.x, sh.box.y, sh.box.w, sh.box.h); } catch (e) { /* skip a broken picture */ }
+        }
+      });
+      prog(0.5 + (i + 1) / model.slides.length * 0.45, 'Drawing slide ' + (i + 1) + ' of ' + model.slides.length + '...');
+    }
+    var blob = doc.output('blob');
+    var note = null;
+    if (model.skipped) {
+      note = model.skipped + ' chart/table shape(s) could not be drawn — charts, tables and SmartArt need a full presentation renderer and are not rendered in this version.';
+    }
+    var result = { files: [{ name: baseOf(file.name) + '.pdf', blob: blob }] };
+    if (note) result.note = note;
+    return result;
+  }
+
   var TOOLS = {
     'merge-pdf': { libs: ['pdflib'], run: toolMergePdf },
     'split-pdf': { libs: ['pdflib'], run: toolSplitPdf },
@@ -1278,12 +1755,14 @@
     'pdf-to-png': { libs: ['pdfjs'], run: function (f, o, p) { return toolPdfToImages(f, o, p, 'png'); } },
     'pdf-to-text': { libs: ['pdfjs'], run: toolPdfToText },
     'pdf-to-excel': { libs: ['pdfjs', 'xlsx'], run: toolPdfToExcel },
+    'pdf-to-powerpoint': { libs: ['pdfjs', 'pptxgenjs'], run: toolPdfToPptx },
     'word-to-pdf': { libs: ['mammoth', 'html2canvas', 'jspdf'], run: toolWordToPdf },
     'excel-to-pdf': { libs: ['xlsx', 'html2canvas', 'jspdf'], run: toolExcelToPdf },
     'jpg-to-pdf': { libs: ['jspdf'], run: toolImagesToPdf },
     'txt-to-pdf': { libs: ['jspdf'], run: toolTextToPdf },
     'csv-to-pdf': { libs: ['html2canvas', 'jspdf'], run: toolCsvToPdf },
     'html-to-pdf': { libs: ['html2canvas', 'jspdf'], run: toolHtmlToPdf },
+    'powerpoint-to-pdf': { libs: ['jszip', 'jspdf'], run: toolPptxToPdf },
     'png-to-jpg': { libs: [], run: function (f, o, p) { return toolImageToImage(f, o, p, 'jpg'); } },
     'image-converter': { libs: [], run: function (f, o, p) { return toolImageToImage(f, o, p, o.target || 'jpg'); } },
     'resize-image': { libs: [], run: toolResizeImage },
@@ -1323,6 +1802,8 @@
       boxesFromTextItems: boxesFromTextItems,
       layoutLinesFromBoxes: layoutLinesFromBoxes,
       buildLayoutDocxXml: buildLayoutDocxXml,
+      letterSpacingPts: letterSpacingPts,
+      parsePptx: parsePptx,
       isNoiseLine: isNoiseLine
     }
   };
