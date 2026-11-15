@@ -1575,6 +1575,12 @@
         if (!container.textContent.trim() && !container.querySelector('img, table')) {
           throw new Error('empty render');
         }
+        /* docx-preview draws its pages on a grey frame with shadows, like
+           a document viewer — flatten it to plain white pages for print. */
+        var flat = document.createElement('style');
+        flat.textContent = '.docx-wrapper{background:#ffffff!important;padding:0!important;}' +
+          '.docx-wrapper section.docx{box-shadow:none!important;margin:0 auto!important;}';
+        container.appendChild(flat);
         prog(0.4, 'Laying out the pages...');
         blob = await htmlContainerToPdf(container, prog);
       } finally {
