@@ -569,12 +569,23 @@
     return (chars * charFactor + spaces * 0.25) * size;
   }
 
+  /* Canva-style headings store their letter-spacing as literal spaces:
+     "S A L E ' S M A N". The spread is already in the string, so adding
+     character spacing on top would spread it twice. */
+  function isAlreadySpaced(text) {
+    var tokens = String(text).trim().split(/\s+/).filter(Boolean);
+    if (tokens.length < 4) return false;
+    var singles = tokens.filter(function (t) { return t.length === 1; }).length;
+    return singles / tokens.length > 0.6;
+  }
+
   /* Letter-spaced headings (common in CV templates: "C O N T A C T") store
      their spacing as glyph positions, not characters, so the extracted
      text looks joined in Word/PowerPoint. When a line's span is much
      wider than its text, return the extra spacing per character (points)
      so it can be rendered spread out the way it looked in the PDF. */
   function letterSpacingPts(line) {
+    if (isAlreadySpaced(line.text)) return 0;
     var chars = line.text.replace(/ /g, '').length;
     var expected = estTextWidthPt(line.text, line.size);
     if (chars < 3 || line.w <= expected * 1.25) return 0;
@@ -585,10 +596,12 @@
   /* Fit each line's box: wide enough for its rendered text, but never
      running into the next box on the same row (the next column) — a long
      line in a narrow column wraps inside its own box instead of painting
-     over the neighbour, the way it wrapped in the PDF. A single long word
-     (an email address) cannot wrap, so when it is wider than its column
-     its font size shrinks until it fits — OCR often overestimates such a
-     word's size. Returns a parallel array of { w, h, size, wraps }. */
+     over the neighbour, the way it wrapped in the PDF. A line that would
+     wrap and spill onto the row below (rows in a CV sit ~13pt apart, so
+     a wrapped line always collides with the next row) instead shrinks its
+     font a little until it fits on one line — never more than 20%
+     smaller, and only when it actually overflows its column. Returns a
+     parallel array of { w, h, size, wraps }. */
   function fitLineBoxes(lines, pageWidth) {
     return lines.map(function (line) {
       var x = Math.max(0, Math.min(line.x, pageWidth - 20));
@@ -601,12 +614,20 @@
       });
       var size = line.size;
       var estW = estTextWidthPt(line.text, size);
-      var w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estW * 1.15 + 6), pageWidth - x - 2, rightLimit - x));
-      if (line.text.trim().indexOf(' ') === -1 && estW > w) {
-        /* Shrink with a safety margin: wide characters (w, m, @) render
-           wider than the average estimate, so aim for 90% of the box. */
-        size = Math.max(6, size * ((w * 0.9) / estW));
+      var avail = Math.max(20, Math.min(pageWidth - x - 2, rightLimit - x));
+      var w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estW * 1.15 + 6), avail));
+      if (estW > avail) {
+        /* Shrink to fit one line. Single words cannot wrap at all, so
+           they get a wider safety margin; wide characters (w, m, @)
+           render wider than the average estimate. */
+        var singleWord = line.text.trim().indexOf(' ') === -1;
+        var margin = singleWord ? 0.9 : 0.95;
+        /* Single words cannot wrap, so they shrink as far as needed;
+           multi-word lines shrink at most 20% and wrap past that. */
+        var floor = singleWord ? 6 : size * 0.8;
+        size = Math.max(floor, Math.min(size, size * ((avail * margin) / estW)));
         estW = estTextWidthPt(line.text, size);
+        w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estW * 1.15 + 6), avail));
       }
       var wraps = Math.min(4, Math.max(1, Math.ceil(estW / Math.max(w, 20))));
       return { w: w, h: size * 1.5 * wraps, size: size, wraps: wraps };
