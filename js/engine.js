@@ -1555,6 +1555,73 @@
     return doc.output('blob');
   }
 
+  /* docx-preview draws list markers (bullets, numbers) with CSS
+     ::before content and counters, which the page renderer cannot
+     reproduce — bullets came out invisible and numbers missing. Replace
+     them with literal marker text in the document itself: bullets become
+     a real bullet character, numbered items get their sequence number.
+     Marker styles are read from the stylesheet docx-preview injects. */
+  function fixDocxListMarkers(container) {
+    var cssText = '';
+    container.querySelectorAll('style').forEach(function (st) { cssText += st.textContent + '\n'; });
+    var markerByClass = {};
+    /* Numbered rules look like: content: ""counter(docx-num-5-0, decimal)".\9";
+       bullet rules like: content: "<glyph>\9"; — capture the whole value. */
+    var re = /p\.(docx-num-[\w-]+):before\s*\{[^}]*content:\s*([^;]+);/g;
+    var m;
+    while ((m = re.exec(cssText)) !== null) {
+      var raw = m[2].trim();
+      var cm = raw.match(/counter\([^,)]+(?:,\s*([\w-]+))?\)/);
+      if (cm) {
+        var after = raw.slice(raw.indexOf(cm[0]) + cm[0].length);
+        var suffix = '';
+        after.replace(/"((?:[^"\\]|\\.)*)"/g, function (_, s) { suffix += s.replace(/\\9/g, ' ').replace(/\\"/g, '"'); });
+        markerByClass[m[1]] = { type: 'counter', style: (cm[1] || 'decimal').toLowerCase(), suffix: suffix || '. ' };
+      } else {
+        var q = raw.match(/"((?:[^"\\]|\\.)*)"/);
+        var ch = q ? q[1].replace(/\\9/g, '').trim().charAt(0) : '';
+        if (ch) markerByClass[m[1]] = { type: 'bullet', ch: ch };
+      }
+    }
+    var counters = {};
+    function toAlpha(n, upper) {
+      var s = '';
+      while (n > 0) { var r = (n - 1) % 26; s = String.fromCharCode((upper ? 65 : 97) + r) + s; n = Math.floor((n - 1) / 26); }
+      return s || 'a';
+    }
+    function toRoman(n, upper) {
+      var table = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+      var s = '';
+      for (var i = 0; i < table.length; i++) { while (n >= table[i][0]) { s += table[i][1]; n -= table[i][0]; } }
+      return upper ? s : s.toLowerCase();
+    }
+    container.querySelectorAll('p[class*="docx-num-"]').forEach(function (p) {
+      var cls = null;
+      for (var i = 0; i < p.classList.length; i++) {
+        if (p.classList[i].indexOf('docx-num-') === 0) { cls = p.classList[i]; break; }
+      }
+      if (!cls || !markerByClass[cls]) return;
+      var marker = markerByClass[cls];
+      var text;
+      if (marker.type === 'counter') {
+        counters[cls] = (counters[cls] || 0) + 1;
+        var n = counters[cls], style = marker.style;
+        var num = style === 'lower-alpha' ? toAlpha(n, false) : style === 'upper-alpha' ? toAlpha(n, true) :
+          style === 'lower-roman' ? toRoman(n, false) : style === 'upper-roman' ? toRoman(n, true) : String(n);
+        text = num + marker.suffix;
+      } else {
+        /* Symbol/Wingdings private-use bullets map to plain glyphs. */
+        var ch = marker.ch;
+        var code = ch.charCodeAt(0);
+        var bulletMap = { 0xF0B7: '•', 0xF0A7: '▪', 0xF0D8: '➢', 0xF0FC: '✓', 0xF02D: '–', 0xF0BE: '›' };
+        text = (bulletMap[code] || (code >= 0xF000 && code <= 0xF8FF ? '•' : ch)) + '  ';
+      }
+      var span = document.createElement('span');
+      span.textContent = text;
+      p.insertBefore(span, p.firstChild);
+    });
+  }
+
   async function toolWordToPdf(files, opts, prog) {
     var file = files[0]; assertSize(file);
     prog(0.1, 'Reading the Word document...');
@@ -1579,8 +1646,10 @@
            a document viewer — flatten it to plain white pages for print. */
         var flat = document.createElement('style');
         flat.textContent = '.docx-wrapper{background:#ffffff!important;padding:0!important;}' +
-          '.docx-wrapper section.docx{box-shadow:none!important;margin:0 auto!important;}';
+          '.docx-wrapper section.docx{box-shadow:none!important;margin:0 auto!important;}' +
+          'p[class*="docx-num-"]:before{content:none!important;}';
         container.appendChild(flat);
+        fixDocxListMarkers(container);
         prog(0.4, 'Laying out the pages...');
         blob = await htmlContainerToPdf(container, prog);
       } finally {
@@ -2402,6 +2471,7 @@
     baseOf: baseOf,
     maxBytes: MAX_BYTES,
     _internals: {
+      fixDocxListMarkers: fixDocxListMarkers,
       parsePageRanges: parsePageRanges,
       parseCsv: parseCsv,
       groupTextItems: groupTextItems,
