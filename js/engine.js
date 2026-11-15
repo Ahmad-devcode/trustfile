@@ -288,7 +288,8 @@
         text: String(w.text || ''),
         x0: (bb.x0 || 0) / s, y0: (bb.y0 || 0) / s, x1: (bb.x1 || 0) / s, y1: (bb.y1 || 0) / s,
         size: Math.max(6, h / 1.15),
-        bold: false, italic: false, font: ''
+        bold: false, italic: false, font: '',
+        conf: (typeof w.confidence === 'number' ? w.confidence : 100)
       };
     }).filter(function (b) {
       var t = b.text.trim();
@@ -446,6 +447,11 @@
      Word output: text, position (points from the page's top-left corner),
      size, bold/italic and font. */
   function layoutLinesFromBoxes(boxes, isOcr) {
+    /* OCR reads photos and decorations as garbage words ("mm eo oO") with
+       low confidence — drop them before grouping so they cannot overlap
+       real text. Real words on readable scans score well above this. */
+    var usable = isOcr ? boxes.filter(function (b) { return b.conf === undefined || b.conf >= 30; }) : boxes;
+    if (isOcr && usable.length && usable.length < boxes.length) boxes = usable;
     var lines = groupLines(boxes);
     var styled = lines.map(function (line) {
       var words = line.boxes.slice().sort(function (a, b) { return a.x0 - b.x0; });
@@ -576,7 +582,10 @@
     pages.forEach(function (pg, pi) {
       pg.lines.forEach(function (line) {
         shapeId++;
-        var spacingTwips = Math.round(letterSpacingPts(line) * 20);
+        /* Never spread OCR lines: OCR word boxes already carry the visual
+           spacing, and their sizes are underestimated, which made the
+           spacing detector spread every scanned line absurdly wide. */
+        var spacingTwips = pg.isOcr ? 0 : Math.round(letterSpacingPts(line) * 20);
         var x = Math.max(0, Math.min(line.x, pg.width - 20)).toFixed(1);
         var y = Math.max(0, line.y).toFixed(1);
         /* Generous box: font substitution in Word can render text wider
@@ -992,7 +1001,7 @@
             return { text: t, x: 36, y: 36 + i * 18, w: pg.width - 72, size: 11, bold: false, italic: false, font: '' };
           });
         }
-        return { width: pg.width, height: pg.height, lines: lines };
+        return { width: pg.width, height: pg.height, lines: lines, isOcr: pg.isOcr };
       });
       if (!layoutPages.some(function (pg) { return pg.lines.length; })) {
         throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
@@ -1059,7 +1068,7 @@
             return { text: t, x: 36, y: 36 + i * 18, w: pg.width - 72, size: 11, bold: false, italic: false, font: '' };
           });
         }
-        return { width: pg.width, height: pg.height, lines: lines };
+        return { width: pg.width, height: pg.height, lines: lines, isOcr: pg.isOcr };
       });
       if (!slidePages.some(function (pg) { return pg.lines.length; })) {
         throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
@@ -1070,7 +1079,7 @@
       slidePages.forEach(function (pg, idx) {
         var s = pptx.addSlide();
         pg.lines.forEach(function (line) {
-          var spacing = letterSpacingPts(line);
+          var spacing = pg.isOcr ? 0 : letterSpacingPts(line);
           var box = {
             x: Math.max(0, line.x) / 72,
             y: Math.max(0, line.y) / 72,
