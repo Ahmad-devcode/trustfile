@@ -222,82 +222,244 @@
     var size = Math.abs(it.transform[0]) || 10;
     return String(it.str || '').length * size * 0.55;
   }
-  function linesFromItems(items) {
-    var sorted = items.slice().sort(function (a, b) {
-      var dy = b.transform[5] - a.transform[5];
-      if (Math.abs(dy) > 2) return dy;
-      return a.transform[4] - b.transform[4];
+  /* ---- Reading-order layout analysis (XY-cut) ----
+     Both the text layer and OCR words are reduced to boxes
+     {text, x0, y0, x1, y1} with y growing downward, then ordered by
+     recursively cutting whitespace gutters: vertical cuts split columns,
+     horizontal cuts split stacked blocks. This keeps two-column resumes
+     and nested layouts (e.g. a split bottom section) in reading order,
+     even when a column sits on a colored background. */
+  function dedupeBoxes(boxes) {
+    var seen = {};
+    return boxes.filter(function (b) {
+      var key = b.text + '|' + Math.round(b.x0) + '|' + Math.round(b.y0);
+      if (seen[key]) return false;
+      seen[key] = true;
+      return true;
     });
-    var lines = [], current = [], currentY = null;
-    sorted.forEach(function (it) {
-      var y = it.transform[5];
-      if (currentY === null || Math.abs(y - currentY) <= 2) {
-        current.push(it); currentY = y;
+  }
+  function cleanFontName(fontName) {
+    var name = String(fontName || '').replace(/^[^+]*\+/, ''); /* strip subset prefix */
+    name = name.split(/[-,]/)[0].trim();
+    return /^[A-Za-z][A-Za-z0-9 ]*$/.test(name) ? name : '';
+  }
+  function boxesFromTextItems(items, pageHeight, styles) {
+    var ph = pageHeight;
+    if (!ph) {
+      ph = 0;
+      items.forEach(function (it) {
+        ph = Math.max(ph, it.transform[5] + (Math.abs(it.transform[3]) || 10));
+      });
+      ph += 10;
+    }
+    return dedupeBoxes(items.map(function (it) {
+      var size = Math.abs(it.transform[3]) || Math.abs(it.transform[0]) || 10;
+      var x0 = it.transform[4];
+      var yBottom = it.transform[5];
+      /* pdf.js fontName is usually an internal id (g_d0_f1); the styles
+         table sometimes carries the real family name for embedded fonts. */
+      var styleInfo = (styles && styles[it.fontName]) || {};
+      var fontLabel = String(styleInfo.fontFamily || '') + ' ' + String(it.fontName || '');
+      return {
+        text: String(it.str || ''),
+        x0: x0, x1: x0 + itemWidth(it),
+        y1: ph - yBottom,
+        y0: ph - yBottom - size,
+        size: size,
+        bold: /bold/i.test(fontLabel),
+        italic: /italic|oblique/i.test(fontLabel),
+        font: cleanFontName(styleInfo.fontFamily || it.fontName)
+      };
+    }).filter(function (b) { return b.text.trim() !== ''; }));
+  }
+  function boxesFromOcrWords(words, scale) {
+    var s = scale || 1;
+    return dedupeBoxes(words.map(function (w) {
+      var bb = w.bbox || {};
+      var h = ((bb.y1 || 0) - (bb.y0 || 0)) / s;
+      return {
+        text: String(w.text || ''),
+        x0: (bb.x0 || 0) / s, y0: (bb.y0 || 0) / s, x1: (bb.x1 || 0) / s, y1: (bb.y1 || 0) / s,
+        size: Math.max(6, h / 1.15),
+        bold: false, italic: false, font: ''
+      };
+    }).filter(function (b) {
+      var t = b.text.trim();
+      if (!t) return false;
+      if (t.length === 1 && !/[A-Za-z0-9]/.test(t)) return false; /* icon/symbol noise */
+      return b.x1 > b.x0 && b.y1 > b.y0;
+    }));
+  }
+  function medianHeight(boxes) {
+    var hs = boxes.map(function (b) { return b.y1 - b.y0; }).sort(function (a, b) { return a - b; });
+    return hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+  }
+  /* Group boxes into lines: same baseline (y-overlap) and a small x-gap.
+     The x-gap limit keeps words from different columns on separate lines
+     even when they share a baseline; over-splitting a line is harmless
+     (order is preserved), over-merging columns is not. */
+  function groupLines(boxes) {
+    var medH = medianHeight(boxes) || 10;
+    var maxGap = Math.max(8, medH);
+    var sorted = boxes.slice().sort(function (a, b) { return (a.y0 - b.y0) || (a.x0 - b.x0); });
+    var lines = [];
+    sorted.forEach(function (b) {
+      var best = null;
+      for (var i = lines.length - 1; i >= 0; i--) {
+        var line = lines[i];
+        var yOverlap = Math.min(b.y1, line.y1) - Math.max(b.y0, line.y0);
+        var minH = Math.min(b.y1 - b.y0, line.y1 - line.y0);
+        if (yOverlap <= minH * 0.4) continue;
+        var xGap = b.x0 >= line.x1 ? b.x0 - line.x1 : (b.x1 <= line.x0 ? line.x0 - b.x1 : 0);
+        if (xGap > maxGap) continue;
+        best = line; break;
+      }
+      if (best) {
+        best.boxes.push(b);
+        best.x0 = Math.min(best.x0, b.x0); best.x1 = Math.max(best.x1, b.x1);
+        best.y0 = Math.min(best.y0, b.y0); best.y1 = Math.max(best.y1, b.y1);
       } else {
-        lines.push(current); current = [it]; currentY = y;
+        lines.push({ x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, boxes: [b] });
       }
     });
-    if (current.length) lines.push(current);
-    return lines.map(function (line) {
-      return line.map(function (it) { return it.str; }).join(' ').replace(/\s+/g, ' ').trim();
+    return lines;
+  }
+  function renderLines(lines) {
+    var ordered = lines.slice().sort(function (a, b) { return (a.y0 - b.y0) || (a.x0 - b.x0); });
+    return ordered.map(function (line) {
+      var words = line.boxes.slice().sort(function (a, b) { return a.x0 - b.x0; });
+      return words.map(function (b) { return b.text; }).join(' ').replace(/\s+/g, ' ').trim();
     }).filter(function (l) { return l !== ''; });
   }
-  /* Find a vertical whitespace gutter (two-column layout) from text items.
-     Returns the gutter center x, or null for single-column pages. */
-  function findTextGutter(items, pageWidth, pageHeight) {
-    var band = items.filter(function (it) {
-      var y = it.transform[5];
-      return y > pageHeight * 0.12 && y < pageHeight * 0.88;
+  /* Whitespace gaps between merged spans on one axis, widest first. */
+  function cutCandidates(lines, vertical, minGap) {
+    var intervals = lines.map(function (l) {
+      return vertical ? [l.x0, l.x1] : [l.y0, l.y1];
+    }).sort(function (a, b) { return a[0] - b[0]; });
+    var merged = [];
+    intervals.forEach(function (iv) {
+      var last = merged[merged.length - 1];
+      if (last && iv[0] <= last[1] + 2) { last[1] = Math.max(last[1], iv[1]); }
+      else merged.push([iv[0], iv[1]]);
     });
-    if (band.length < 6) return null;
-    var step = 4, best = null, runStart = null;
-    var xEnd = pageWidth * 0.78;
-    for (var x = pageWidth * 0.22; x <= xEnd; x += step) {
-      var ink = band.some(function (it) {
-        var x0 = it.transform[4], x1 = x0 + itemWidth(it);
-        return x >= x0 - 2 && x <= x1 + 2;
+    var out = [];
+    for (var i = 0; i + 1 < merged.length; i++) {
+      var gap = merged[i + 1][0] - merged[i][1];
+      if (gap >= minGap) out.push({ pos: (merged[i][1] + merged[i + 1][0]) / 2, gap: gap });
+    }
+    out.sort(function (a, b) { return b.gap - a.gap; });
+    return out;
+  }
+  function tryVerticalCut(lines, candidates) {
+    for (var c = 0; c < candidates.length; c++) {
+      var pos = candidates[c].pos;
+      var left = [], right = [], spanning = [];
+      lines.forEach(function (l) {
+        if (l.x1 <= pos) left.push(l);
+        else if (l.x0 >= pos) right.push(l);
+        else spanning.push(l);
       });
-      if (!ink) { if (runStart === null) runStart = x; }
-      else if (runStart !== null) {
-        var w = x - runStart;
-        if (!best || w > best.w) best = { x0: runStart, x1: x, w: w };
-        runStart = null;
+      if (left.length < 2 || right.length < 2) continue;
+      var before = [], after = [];
+      if (spanning.length) {
+        var rest = left.concat(right);
+        var minTop = Math.min.apply(null, rest.map(function (l) { return l.y0; }));
+        var maxBottom = Math.max.apply(null, rest.map(function (l) { return l.y1; }));
+        var allAbove = spanning.every(function (l) { return l.y1 <= minTop; });
+        var allBelow = spanning.every(function (l) { return l.y0 >= maxBottom; });
+        if (allAbove) before = spanning;
+        else if (allBelow) after = spanning;
+        else continue;
+      }
+      return { before: before, left: left, right: right, after: after };
+    }
+    return null;
+  }
+  function tryHorizontalCut(lines, candidates) {
+    for (var c = 0; c < candidates.length; c++) {
+      var pos = candidates[c].pos;
+      var top = lines.filter(function (l) { return l.y1 <= pos; });
+      var bottom = lines.filter(function (l) { return l.y0 >= pos; });
+      if (top.length && bottom.length && top.length + bottom.length === lines.length) {
+        return { top: top, bottom: bottom };
       }
     }
-    if (runStart !== null) {
-      var wEnd = xEnd - runStart;
-      if (!best || wEnd > best.w) best = { x0: runStart, x1: xEnd, w: wEnd };
-    }
-    if (!best || best.w < 20) return null;
-    var cx = (best.x0 + best.x1) / 2;
-    var left = band.filter(function (it) { return it.transform[4] < cx; }).length;
-    var right = band.length - left;
-    if (left < 3 || right < 3) return null;
-    return cx;
+    return null;
   }
-  /* Group pdf.js text items into lines, top to bottom, column-aware:
-     two-column pages (resumes, brochures) read left column first, then right,
-     with full-width header lines first. */
+  function xyCutLines(lines, depth) {
+    if (!lines.length) return [];
+    if (lines.length < 2 || depth > 6) return renderLines(lines);
+    var x0 = Math.min.apply(null, lines.map(function (l) { return l.x0; }));
+    var x1 = Math.max.apply(null, lines.map(function (l) { return l.x1; }));
+    var y0 = Math.min.apply(null, lines.map(function (l) { return l.y0; }));
+    var y1 = Math.max.apply(null, lines.map(function (l) { return l.y1; }));
+    var regionW = Math.max(1, x1 - x0), regionH = Math.max(1, y1 - y0);
+    var vCuts = cutCandidates(lines, true, Math.max(8, regionW * 0.02));
+    var hCuts = cutCandidates(lines, false, Math.max(8, regionH * 0.01));
+    var vScore = vCuts.length ? vCuts[0].gap / regionW : 0;
+    var hScore = hCuts.length ? hCuts[0].gap / regionH : 0;
+    var axes = (vCuts.length && vScore >= 0.5 * hScore) ? ['v', 'h'] : ['h', 'v'];
+    for (var a = 0; a < axes.length; a++) {
+      if (axes[a] === 'v') {
+        var v = tryVerticalCut(lines, vCuts);
+        if (v) {
+          var out = renderLines(v.before);
+          out = out.concat(xyCutLines(v.left, depth + 1));
+          out.push('');
+          out = out.concat(xyCutLines(v.right, depth + 1));
+          out = out.concat(renderLines(v.after));
+          return out;
+        }
+      } else {
+        var h = tryHorizontalCut(lines, hCuts);
+        if (h) return xyCutLines(h.top, depth + 1).concat(xyCutLines(h.bottom, depth + 1));
+      }
+    }
+    return renderLines(lines);
+  }
+  function xyCut(boxes, depth) {
+    return xyCutLines(groupLines(boxes), depth || 0);
+  }
+  /* Group pdf.js text items into lines, top to bottom, column-aware. */
   function groupTextItems(items, pageWidth, pageHeight) {
     if (!items || !items.length) return [];
-    if (!pageWidth || !pageHeight) return linesFromItems(items);
-    var gutter = findTextGutter(items, pageWidth, pageHeight);
-    if (gutter === null) return linesFromItems(items);
-    var top = [], left = [], right = [];
-    items.forEach(function (it) {
-      var y = it.transform[5];
-      if (y > pageHeight * 0.88) top.push(it);
-      else if (it.transform[4] < gutter) left.push(it);
-      else right.push(it);
-    });
-    var out = linesFromItems(top);
-    var leftLines = linesFromItems(left);
-    var rightLines = linesFromItems(right);
-    if (out.length && leftLines.length) out.push('');
-    out = out.concat(leftLines);
-    if (leftLines.length && rightLines.length) out.push('');
-    out = out.concat(rightLines);
-    return out;
+    return xyCut(boxesFromTextItems(items, pageHeight), 0);
+  }
+  /* Is this line OCR noise (icon misreads, separator debris)? */
+  function isNoiseLine(text) {
+    var l = String(text).replace(/\s+/g, ' ').trim();
+    if (!l) return true;
+    var alnum = (l.match(/[A-Za-z0-9]/g) || []).length;
+    if (alnum === 0) return true;
+    if (alnum <= 1 && l.length <= 6 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return true;
+    if (l.length <= 3 && alnum <= 2 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return true;
+    return false;
+  }
+  /* Turn positioned boxes into styled lines for the layout-preserving
+     Word output: text, position (points from the page's top-left corner),
+     size, bold/italic and font. */
+  function layoutLinesFromBoxes(boxes, isOcr) {
+    var lines = groupLines(boxes);
+    var styled = lines.map(function (line) {
+      var words = line.boxes.slice().sort(function (a, b) { return a.x0 - b.x0; });
+      var text = words.map(function (b) { return b.text; }).join(' ').replace(/\s+/g, ' ').trim();
+      var size = 0, bold = false, italic = false;
+      var fonts = {};
+      words.forEach(function (b) {
+        size = Math.max(size, b.size || 0);
+        if (b.bold) bold = true;
+        if (b.italic) italic = true;
+        if (b.font) fonts[b.font] = (fonts[b.font] || 0) + 1;
+      });
+      var font = '';
+      Object.keys(fonts).forEach(function (f) { if (!font || fonts[f] > fonts[font]) font = f; });
+      return { text: text, x: line.x0, y: line.y0, w: Math.max(10, line.x1 - line.x0), size: size || 11, bold: bold, italic: italic, font: font };
+    }).filter(function (l) { return l.text !== '' && (!isOcr || !isNoiseLine(l.text)); });
+    /* Headings read bold even when the font name does not say so. */
+    var sizes = styled.map(function (l) { return l.size; }).sort(function (a, b) { return a - b; });
+    var median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 11;
+    styled.forEach(function (l) { if (l.size >= median * 1.35) l.bold = true; });
+    return styled;
   }
 
   /* ---------------- DOCX builder (JSZip + minimal OOXML, no docx lib) ---------------- */
@@ -364,16 +526,63 @@
     '<dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Converted by TrustFile</dc:title>' +
     '<dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">TrustFile</dc:creator>' +
     '</cp:coreProperties>';
-  async function buildDocxBlob(paragraphs) {
+  async function buildDocxZip(documentXml) {
     needLib('jszip');
     var zip = new global.JSZip();
     zip.file('[Content_Types].xml', DOCX_CONTENT_TYPES);
     zip.file('_rels/.rels', DOCX_RELS);
-    zip.file('word/document.xml', buildDocxXml(paragraphs));
+    zip.file('word/document.xml', documentXml);
     zip.file('word/_rels/document.rels', DOCX_WORD_RELS);
     zip.file('word/styles.xml', DOCX_STYLES);
     zip.file('docProps/core.xml', DOCX_CORE);
     return zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+  }
+  async function buildDocxBlob(paragraphs) {
+    return buildDocxZip(buildDocxXml(paragraphs));
+  }
+  /* Layout-preserving Word output: every line becomes an absolutely
+     positioned text box at its original PDF coordinates, on a page of
+     the PDF's own size, with its font size, bold/italic and font kept.
+     Text stays fully editable — each box holds real text, not an image. */
+  function buildLayoutDocxXml(pages) {
+    var shapeId = 0;
+    var parts = [];
+    parts.push('<w:p><w:r><w:pict><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype></w:pict></w:r></w:p>');
+    pages.forEach(function (pg, pi) {
+      pg.lines.forEach(function (line) {
+        shapeId++;
+        var x = Math.max(0, line.x).toFixed(1);
+        var y = Math.max(0, line.y).toFixed(1);
+        var w = Math.max(10, line.w * 1.05 + 6).toFixed(1);
+        var h = (line.size * 1.3).toFixed(1);
+        var rPr = '';
+        if (line.font) rPr += '<w:rFonts w:ascii="' + escapeXml(line.font) + '" w:hAnsi="' + escapeXml(line.font) + '"/>';
+        if (line.bold) rPr += '<w:b/>';
+        if (line.italic) rPr += '<w:i/>';
+        rPr += '<w:sz w:val="' + Math.round(line.size * 2) + '"/><w:szCs w:val="' + Math.round(line.size * 2) + '"/>';
+        parts.push(
+          '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="40" w:lineRule="exact"/></w:pPr>' +
+          '<w:r><w:pict>' +
+          '<v:shape id="tf' + shapeId + '" type="#_x0000_t202" style="position:absolute;left:' + x + 'pt;top:' + y + 'pt;width:' + w + 'pt;height:' + h + 'pt;mso-position-horizontal-relative:page;mso-position-vertical-relative:page" filled="f" stroked="f">' +
+          '<v:textbox inset="0,0,0,0"><w:txbxContent><w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="240" w:lineRule="auto"/></w:pPr>' +
+          '<w:r><w:rPr>' + rPr + '</w:rPr><w:t xml:space="preserve">' + escapeXml(line.text) + '</w:t></w:r>' +
+          '</w:p></w:txbxContent></v:textbox></v:shape>' +
+          '</w:pict></w:r></w:p>'
+        );
+      });
+      if (pi < pages.length - 1) {
+        /* Section break carrying this page's size, so mixed page sizes keep working. */
+        parts.push('<w:p><w:pPr><w:sectPr><w:pgSz w:w="' + Math.round(pg.width * 20) + '" w:h="' + Math.round(pg.height * 20) + '"/><w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0" w:header="0" w:footer="0" w:gutter="0"/><w:type w:val="nextPage"/></w:sectPr></w:pPr></w:p>');
+      }
+    });
+    var last = pages[pages.length - 1] || { width: 595, height: 842 };
+    parts.push('<w:sectPr><w:pgSz w:w="' + Math.round(last.width * 20) + '" w:h="' + Math.round(last.height * 20) + '"/><w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>');
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">' +
+      '<w:body>' + parts.join('') + '</w:body></w:document>';
+  }
+  async function buildLayoutDocxBlob(pages) {
+    return buildDocxZip(buildLayoutDocxXml(pages));
   }
 
   /* ---------------- PDF loading helpers ---------------- */
@@ -411,96 +620,40 @@
     } catch (e) { /* canvas unreadable — use the original pixels */ }
     return out;
   }
-  function downscaleGray(canvas, targetW) {
-    var w = targetW, h = Math.max(1, Math.round(canvas.height * w / canvas.width));
-    var small = document.createElement('canvas');
-    small.width = w; small.height = h;
-    var ctx = small.getContext('2d');
-    ctx.drawImage(canvas, 0, 0, w, h);
-    var d = ctx.getImageData(0, 0, w, h).data;
-    var gray = new Float32Array(w * h);
-    for (var i = 0, p = 0; i < d.length; i += 4, p++) {
-      gray[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    }
-    return { w: w, h: h, gray: gray };
-  }
-  /* Find a vertical whitespace gutter in a rendered page image.
-     Returns the gutter center as a fraction of the width, or null. */
-  function findCanvasGutter(canvas) {
-    var g = downscaleGray(canvas, 400);
-    var y0 = Math.floor(g.h * 0.15), y1 = Math.floor(g.h * 0.85);
-    var bandH = Math.max(1, y1 - y0);
-    var best = null, runStart = null;
-    var xEnd = Math.floor(g.w * 0.78);
-    for (var x = Math.floor(g.w * 0.22); x <= xEnd; x++) {
-      var ink = 0;
-      for (var y = y0; y < y1; y++) { if (g.gray[y * g.w + x] < 170) ink++; }
-      var empty = ink < bandH * 0.01;
-      if (empty) { if (runStart === null) runStart = x; }
-      else if (runStart !== null) {
-        var w = x - runStart;
-        if (!best || w > best.w) best = { x0: runStart, x1: x, w: w };
-        runStart = null;
-      }
-    }
-    if (runStart !== null) {
-      var wEnd = xEnd - runStart;
-      if (!best || wEnd > best.w) best = { x0: runStart, x1: xEnd, w: wEnd };
-    }
-    if (!best || best.w < g.w * 0.035) return null;
-    var leftInk = 0, rightInk = 0;
-    for (var y = y0; y < y1; y++) {
-      for (var x2 = 0; x2 < best.x0; x2++) if (g.gray[y * g.w + x2] < 170) leftInk++;
-      for (var x3 = best.x1; x3 < g.w; x3++) if (g.gray[y * g.w + x3] < 170) rightInk++;
-    }
-    if (leftInk < 300 || rightInk < 300) return null;
-    return (best.x0 + best.x1) / 2 / g.w;
-  }
-  /* Find a horizontal whitespace band in the top of the page (to cut the
-     full-width header strip). Returns the cut as a y fraction, or null. */
-  function findStripCut(canvas, maxFrac) {
-    var g = downscaleGray(canvas, 300);
-    var maxY = Math.floor(g.h * maxFrac);
-    var bestY = null;
-    for (var y = Math.floor(g.h * 0.04); y < maxY; y++) {
-      var ink = 0;
-      for (var x = 0; x < g.w; x++) { if (g.gray[y * g.w + x] < 170) ink++; }
-      if (ink < g.w * 0.01) bestY = y; /* keep the lowest whitespace row */
-    }
-    return bestY === null ? null : bestY / g.h;
-  }
-  function cropCanvas(src, x0, y0, x1, y1) {
-    var c = document.createElement('canvas');
-    c.width = Math.max(1, x1 - x0); c.height = Math.max(1, y1 - y0);
-    c.getContext('2d').drawImage(src, x0, y0, c.width, c.height, 0, 0, c.width, c.height);
-    return c;
-  }
-  async function ocrCanvas(worker, canvas) {
-    var ret = await worker.recognize(prepCanvas(canvas));
-    var text = (ret && ret.data && ret.data.text) || '';
-    return text.split(/\n/).map(function (l) { return l.trim(); }).filter(function (l) { return l !== ''; });
-  }
-  /* Drop OCR noise: icon misreads and separator lines. Keeps real content. */
+  /* Drop OCR noise: icon misreads and separator lines. Blank separators
+     between layout blocks are preserved (collapsed to one). */
   function cleanOcrLines(lines) {
-    return lines.map(function (l) { return String(l).replace(/\s+/g, ' ').trim(); }).filter(function (l) {
-      if (!l) return false;
+    var out = [];
+    lines.forEach(function (raw) {
+      var l = String(raw).replace(/\s+/g, ' ').trim();
+      if (!l) {
+        if (out.length && out[out.length - 1] !== '') out.push('');
+        return;
+      }
       var alnum = (l.match(/[A-Za-z0-9]/g) || []).length;
-      if (alnum === 0) return false;
-      if (alnum <= 1 && l.length <= 6 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return false;
-      if (l.length <= 3 && alnum <= 2 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return false;
-      return true;
+      if (alnum === 0) return;
+      if (alnum <= 1 && l.length <= 6 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return;
+      if (l.length <= 3 && alnum <= 2 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return;
+      out.push(l);
     });
+    while (out.length && out[0] === '') out.shift();
+    while (out.length && out[out.length - 1] === '') out.pop();
+    return out;
   }
 
   /* Read the text of every page. Pages with no selectable text (scanned /
      image-only pages) are read automatically with OCR (Tesseract.js),
      so scanned PDFs work too. onPage(pageNum, total, label) reports progress. */
-  async function pdfPagesText(file, onPage) {
+  /* Read every page once: positioned boxes (with style info) from the
+     text layer, or from OCR when a page has no text layer. Consumers
+     either order the boxes into reading order (text/Excel) or lay them
+     out at their original positions (Word with layout kept). */
+  async function pdfPages(file, onPage) {
     var pdf = await loadPdfJs(file);
     var pages = [];
     var ocrWorker = null;
     var ocrTried = false;
-    async function ocrPage(page, pageNum, total) {
+    async function ocrPageBoxes(page, pageNum, total) {
       if (!ocrTried) {
         ocrTried = true;
         if (onPage) onPage(pageNum, total, 'Loading text recognition (one-time download)...');
@@ -522,54 +675,53 @@
       var ctx = canvas.getContext('2d');
       ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       await page.render({ canvasContext: ctx, viewport: viewport }).promise;
-      var gutter = null;
-      try { gutter = findCanvasGutter(canvas); } catch (e) { gutter = null; }
-      var lines;
-      if (gutter !== null) {
-        /* Two-column page: read the full-width header strip first, then
-           each column separately, so columns never mix on one line. */
-        var gx = Math.floor(canvas.width * gutter);
-        var cutFrac = null;
-        try { cutFrac = findStripCut(canvas, 0.18); } catch (e) { cutFrac = null; }
-        var cutY = cutFrac !== null ? Math.floor(canvas.height * cutFrac) : 0;
-        lines = [];
-        if (cutY > canvas.height * 0.03) {
-          lines = lines.concat(await ocrCanvas(ocrWorker, cropCanvas(canvas, 0, 0, canvas.width, cutY)));
-        }
-        var leftLines = await ocrCanvas(ocrWorker, cropCanvas(canvas, 0, cutY, gx, canvas.height));
-        var rightLines = await ocrCanvas(ocrWorker, cropCanvas(canvas, gx, cutY, canvas.width, canvas.height));
-        if (lines.length && leftLines.length) lines.push('');
-        lines = lines.concat(leftLines);
-        if (leftLines.length && rightLines.length) lines.push('');
-        lines = lines.concat(rightLines);
-      } else {
-        lines = await ocrCanvas(ocrWorker, canvas);
+      var ret = await ocrWorker.recognize(prepCanvas(canvas));
+      var words = (ret && ret.data && ret.data.words) || [];
+      var boxes = boxesFromOcrWords(words, 2);
+      var fallbackLines = [];
+      if (!boxes.length) {
+        var text = (ret && ret.data && ret.data.text) || '';
+        fallbackLines = text.split(/\n/).map(function (l) { return l.trim(); }).filter(function (l) { return l !== ''; });
       }
-      return cleanOcrLines(lines);
+      return { boxes: boxes, fallbackLines: fallbackLines };
     }
     try {
       for (var p = 1; p <= pdf.numPages; p++) {
         var page = await pdf.getPage(p);
         var vp = page.getViewport({ scale: 1 });
         var content = await page.getTextContent();
-        var lines = groupTextItems(content.items, vp.width, vp.height);
-        if (!lines.length) {
+        var boxes = boxesFromTextItems(content.items, vp.height, content.styles);
+        var isOcr = false, fallbackLines = [];
+        if (!boxes.length) {
           try {
-            lines = await ocrPage(page, p, pdf.numPages);
+            var ocr = await ocrPageBoxes(page, p, pdf.numPages);
+            boxes = ocr.boxes; fallbackLines = ocr.fallbackLines; isOcr = true;
           } catch (ocrErr) {
             /* OCR unavailable (e.g. no network for the language data) —
                keep the page empty; the tool reports clearly if ALL pages
                end up empty. */
-            lines = [];
+            boxes = [];
           }
         }
-        pages.push(lines);
+        pages.push({ width: vp.width, height: vp.height, boxes: boxes, fallbackLines: fallbackLines, isOcr: isOcr });
         if (onPage) onPage(p, pdf.numPages);
       }
     } finally {
       if (ocrWorker) { try { await ocrWorker.terminate(); } catch (e) { /* ignore */ } }
     }
     return { numPages: pdf.numPages, pages: pages };
+  }
+
+  async function pdfPagesText(file, onPage) {
+    var result = await pdfPages(file, onPage);
+    var pages = result.pages.map(function (pg) {
+      if (pg.boxes.length) {
+        var lines = xyCut(pg.boxes, 0);
+        return pg.isOcr ? cleanOcrLines(lines) : lines;
+      }
+      return pg.isOcr ? cleanOcrLines(pg.fallbackLines) : pg.fallbackLines;
+    });
+    return { numPages: result.numPages, pages: pages };
   }
 
   /* Render an HTML string to a paginated A4 PDF (html2canvas + jsPDF). */
@@ -797,6 +949,28 @@
   async function toolPdfToDocx(files, opts, prog) {
     needLib('jszip');
     var file = files[0]; assertSize(file);
+    var keepLayout = !opts || opts.keepLayout !== false;
+    if (keepLayout) {
+      /* Layout mode (default): every line keeps its original position,
+         size, bold/italic and font — CVs and two-column layouts look
+         the same in Word as they did in the PDF. */
+      var layout = await pdfPages(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
+      var layoutPages = layout.pages.map(function (pg) {
+        var lines = pg.boxes.length ? layoutLinesFromBoxes(pg.boxes, pg.isOcr) : [];
+        if (!lines.length && pg.fallbackLines.length) {
+          lines = pg.fallbackLines.map(function (t, i) {
+            return { text: t, x: 36, y: 36 + i * 18, w: pg.width - 72, size: 11, bold: false, italic: false, font: '' };
+          });
+        }
+        return { width: pg.width, height: pg.height, lines: lines };
+      });
+      if (!layoutPages.some(function (pg) { return pg.lines.length; })) {
+        throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
+      }
+      prog(0.9, 'Building the Word document...');
+      var layoutBlob = await buildLayoutDocxBlob(layoutPages);
+      return { files: [{ name: baseOf(file.name) + '.docx', blob: layoutBlob }] };
+    }
     var result = await pdfPagesText(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
     var paragraphs = [];
     result.pages.forEach(function (lines, idx) {
@@ -1031,6 +1205,45 @@
   }
 
   /* ================= Tool registry ================= */
+  async function toolResizeImage(files, opts, prog) {
+    var file = files[0]; assertSize(file);
+    var img = await loadImage(await readDataURL(file));
+    var srcW = img.naturalWidth, srcH = img.naturalHeight;
+    var mode = opts.mode || 'percent';
+    var newW, newH;
+    if (mode === 'pixels') {
+      var w = parseInt(opts.width, 10) || 0, h = parseInt(opts.height, 10) || 0;
+      if (!w && !h) throw new Error('Enter a width, a height, or both.');
+      if (opts.keepAspect !== false) {
+        if (w && h) { var r = Math.min(w / srcW, h / srcH); newW = Math.round(srcW * r); newH = Math.round(srcH * r); }
+        else if (w) { newW = w; newH = Math.round(srcH * w / srcW); }
+        else { newH = h; newW = Math.round(srcW * h / srcH); }
+      } else {
+        newW = w || srcW; newH = h || srcH;
+      }
+    } else {
+      var pct = parseFloat(opts.percent || '50') || 50;
+      if (pct <= 0 || pct > 1000) throw new Error('Percentage must be between 1 and 1000.');
+      newW = Math.max(1, Math.round(srcW * pct / 100));
+      newH = Math.max(1, Math.round(srcH * pct / 100));
+    }
+    if (newW > 8000 || newH > 8000) throw new Error('The resized image is too large (max 8000 px on a side).');
+    prog(0.4, 'Resizing to ' + newW + ' x ' + newH + ' px...');
+    var canvas = document.createElement('canvas');
+    canvas.width = newW; canvas.height = newH;
+    var ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    var format = opts.format || 'keep';
+    var ext = (file.name.split('.').pop() || '').toLowerCase();
+    var target = format === 'keep' ? (ext === 'jpg' || ext === 'jpeg' ? 'jpg' : (ext === 'webp' ? 'webp' : 'png')) : format;
+    if (target === 'jpg') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, newW, newH); }
+    ctx.drawImage(img, 0, 0, newW, newH);
+    var quality = parseFloat(opts.quality || '0.92') || 0.92;
+    var mime = target === 'jpg' ? 'image/jpeg' : (target === 'webp' ? 'image/webp' : 'image/png');
+    var blob = await canvasToBlob(canvas, mime, quality);
+    return { files: [{ name: baseOf(file.name) + '-' + newW + 'x' + newH + '.' + target, blob: blob }] };
+  }
+
   var TOOLS = {
     'merge-pdf': { libs: ['pdflib'], run: toolMergePdf },
     'split-pdf': { libs: ['pdflib'], run: toolSplitPdf },
@@ -1052,6 +1265,7 @@
     'html-to-pdf': { libs: ['html2canvas', 'jspdf'], run: toolHtmlToPdf },
     'png-to-jpg': { libs: [], run: function (f, o, p) { return toolImageToImage(f, o, p, 'jpg'); } },
     'image-converter': { libs: [], run: function (f, o, p) { return toolImageToImage(f, o, p, o.target || 'jpg'); } },
+    'resize-image': { libs: [], run: toolResizeImage },
     'txt-to-word': { libs: ['jszip'], run: toolTextToDocx },
     'word-to-text': { libs: ['mammoth'], run: toolDocxToText },
     'excel-to-csv': { libs: ['xlsx'], run: function (f, o, p) { return toolSheetConvert(f, o, p, o.target || 'csv'); } }
@@ -1083,7 +1297,12 @@
       isHeadingLine: isHeadingLine,
       toDocxItems: toDocxItems,
       cleanOcrLines: cleanOcrLines,
-      findTextGutter: findTextGutter
+      orderBoxes: xyCut,
+      boxesFromOcrWords: boxesFromOcrWords,
+      boxesFromTextItems: boxesFromTextItems,
+      layoutLinesFromBoxes: layoutLinesFromBoxes,
+      buildLayoutDocxXml: buildLayoutDocxXml,
+      isNoiseLine: isNoiseLine
     }
   };
   if (typeof module !== 'undefined' && module.exports) {
