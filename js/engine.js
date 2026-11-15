@@ -64,6 +64,13 @@
         'https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'
       ],
       check: function () { return !!global.html2canvas; }
+    },
+    tesseract: {
+      urls: [
+        'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js',
+        'https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js'
+      ],
+      check: function () { return !!(global.Tesseract && global.Tesseract.createWorker); }
     }
   };
   var loadedLibs = {};
@@ -297,14 +304,60 @@
       throw new Error('This PDF could not be opened. It may be damaged or protected with a password that this tool cannot remove.');
     }
   }
+  /* Read the text of every page. Pages with no selectable text (scanned /
+     image-only pages) are read automatically with OCR (Tesseract.js),
+     so scanned PDFs work too. onPage(pageNum, total, label) reports progress. */
   async function pdfPagesText(file, onPage) {
     var pdf = await loadPdfJs(file);
     var pages = [];
-    for (var p = 1; p <= pdf.numPages; p++) {
-      var page = await pdf.getPage(p);
-      var content = await page.getTextContent();
-      pages.push(groupTextItems(content.items));
-      if (onPage) onPage(p, pdf.numPages);
+    var ocrWorker = null;
+    var ocrTried = false;
+    async function ocrPage(page, pageNum, total) {
+      if (!ocrTried) {
+        ocrTried = true;
+        if (onPage) onPage(pageNum, total, 'Loading text recognition (one-time download)...');
+        await loadLib('tesseract');
+        needLib('tesseract');
+        var oem = (global.Tesseract.OEM && global.Tesseract.OEM.LSTM_ONLY) || 1;
+        ocrWorker = await global.Tesseract.createWorker('eng', oem, {
+          logger: function (m) {
+            if (onPage && m.status) {
+              onPage(pageNum, total, 'Text recognition: ' + m.status + (m.progress ? ' ' + Math.round(m.progress * 100) + '%' : ''));
+            }
+          }
+        });
+      }
+      if (onPage) onPage(pageNum, total, 'Reading page ' + pageNum + ' as an image (OCR)...');
+      var viewport = page.getViewport({ scale: 2 });
+      var canvas = document.createElement('canvas');
+      canvas.width = viewport.width; canvas.height = viewport.height;
+      var ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+      var ret = await ocrWorker.recognize(canvas);
+      var text = (ret && ret.data && ret.data.text) || '';
+      return text.split(/\n/).map(function (l) { return l.trim(); }).filter(function (l) { return l !== ''; });
+    }
+    try {
+      for (var p = 1; p <= pdf.numPages; p++) {
+        var page = await pdf.getPage(p);
+        var content = await page.getTextContent();
+        var lines = groupTextItems(content.items);
+        if (!lines.length) {
+          try {
+            lines = await ocrPage(page, p, pdf.numPages);
+          } catch (ocrErr) {
+            /* OCR unavailable (e.g. no network for the language data) —
+               keep the page empty; the tool reports clearly if ALL pages
+               end up empty. */
+            lines = [];
+          }
+        }
+        pages.push(lines);
+        if (onPage) onPage(p, pdf.numPages);
+      }
+    } finally {
+      if (ocrWorker) { try { await ocrWorker.terminate(); } catch (e) { /* ignore */ } }
     }
     return { numPages: pdf.numPages, pages: pages };
   }
@@ -525,23 +578,23 @@
   /* ================= Convert FROM pdf (pdf.js) ================= */
   async function toolPdfToText(files, opts, prog) {
     var file = files[0]; assertSize(file);
-    var result = await pdfPagesText(file, function (p, total) { prog(p / total, 'Reading page ' + p + ' of ' + total + '...'); });
+    var result = await pdfPagesText(file, function (p, total, label) { prog(p / total, label || ('Reading page ' + p + ' of ' + total + '...')); });
     var text = result.pages.map(function (lines) { return lines.join('\n'); }).join('\n\n');
-    if (!text.trim()) throw new Error('No text was found in this PDF. It may be a scanned (image-only) PDF, which needs OCR software.');
+    if (!text.trim()) throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
     return { files: [{ name: baseOf(file.name) + '.txt', blob: new Blob([text], { type: 'text/plain' }) }] };
   }
 
   async function toolPdfToDocx(files, opts, prog) {
     needLib('jszip');
     var file = files[0]; assertSize(file);
-    var result = await pdfPagesText(file, function (p, total) { prog(p / total * 0.8, 'Reading page ' + p + ' of ' + total + '...'); });
+    var result = await pdfPagesText(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
     var paragraphs = [];
     result.pages.forEach(function (lines, idx) {
       if (idx > 0) paragraphs.push('');
       lines.forEach(function (l) { paragraphs.push(l); });
     });
     if (!paragraphs.some(function (l) { return l.trim(); })) {
-      throw new Error('No text was found in this PDF. It may be a scanned (image-only) PDF, which needs OCR software.');
+      throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
     }
     prog(0.9, 'Building the Word document...');
     var blob = await buildDocxBlob(paragraphs);
@@ -572,7 +625,7 @@
   async function toolPdfToExcel(files, opts, prog) {
     needLib('xlsx');
     var file = files[0]; assertSize(file);
-    var result = await pdfPagesText(file, function (p, total) { prog(p / total * 0.8, 'Reading page ' + p + ' of ' + total + '...'); });
+    var result = await pdfPagesText(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
     var rows = [];
     result.pages.forEach(function (lines, idx) {
       if (idx > 0) rows.push([]);
@@ -580,7 +633,7 @@
         rows.push(line.split(/\t| {2,}/).map(function (c) { return c.trim(); }));
       });
     });
-    if (!rows.length) throw new Error('No text was found in this PDF. It may be a scanned (image-only) PDF, which needs OCR software.');
+    if (!rows.length) throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
     var wb = global.XLSX.utils.book_new();
     global.XLSX.utils.book_append_sheet(wb, global.XLSX.utils.aoa_to_sheet(rows), 'PDF Text');
     var arr = global.XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
