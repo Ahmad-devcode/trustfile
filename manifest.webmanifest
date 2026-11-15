@@ -1,0 +1,16 @@
+{
+  "name": "TrustFile - Free Online File Converter",
+  "short_name": "TrustFile",
+  "description": "Convert PDF, Word, Excel and images free online. Files never leave your device.",
+  "start_url": ".",
+  "display": "browser",
+  "background_color": "#ffffff",
+  "theme_color": "#1e40af",
+  "icons": [
+    {
+      "src": "assets/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
