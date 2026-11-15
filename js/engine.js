@@ -582,8 +582,34 @@
     return Math.min(8, Math.max(0, (line.w - expected) / gaps));
   }
 
-  /* Fragments OCR reads from rules, borders and photos ("mm eo", "_ — mm"):
-     no word longer than 2 letters, at most 3 words, almost no letters. */
+  /* Fit each line's box: wide enough for its rendered text, but never
+     running into the next box on the same row (the next column) — a long
+     line in a narrow column wraps inside its own box instead of painting
+     over the neighbour, the way it wrapped in the PDF. A single long word
+     (an email address) cannot wrap, so when it is wider than its column
+     its font size shrinks until it fits — OCR often overestimates such a
+     word's size. Returns a parallel array of { w, h, size, wraps }. */
+  function fitLineBoxes(lines, pageWidth) {
+    return lines.map(function (line) {
+      var x = Math.max(0, Math.min(line.x, pageWidth - 20));
+      var rightLimit = pageWidth;
+      lines.forEach(function (other) {
+        if (other === line || other.x <= line.x) return;
+        var yOverlap = Math.min(line.y + line.size, other.y + other.size) - Math.max(line.y, other.y);
+        var minH = Math.min(line.size, other.size);
+        if (yOverlap > minH * 0.3) rightLimit = Math.min(rightLimit, other.x - 4);
+      });
+      var size = line.size;
+      var estW = estTextWidthPt(line.text, size);
+      var w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estW * 1.15 + 6), pageWidth - x - 2, rightLimit - x));
+      if (line.text.trim().indexOf(' ') === -1 && estW > w) {
+        size = Math.max(6, size * (w / estW) * 0.98);
+        estW = estTextWidthPt(line.text, size);
+      }
+      var wraps = Math.min(4, Math.max(1, Math.ceil(estW / Math.max(w, 20))));
+      return { w: w, h: size * 1.5 * wraps, size: size, wraps: wraps };
+    });
+  }
   function isFragmentLine(text) {
     var words = String(text).trim().split(/\s+/).filter(Boolean);
     if (!words.length || words.length > 3) return false;
@@ -626,7 +652,8 @@
     var parts = [];
     parts.push('<w:p><w:r><w:pict><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype></w:pict></w:r></w:p>');
     pages.forEach(function (pg, pi) {
-      pg.lines.forEach(function (line) {
+      var fitted = fitLineBoxes(pg.lines, pg.width);
+      pg.lines.forEach(function (line, li) {
         shapeId++;
         /* Never spread OCR lines: OCR word boxes already carry the visual
            spacing, and their sizes are underestimated, which made the
@@ -634,19 +661,14 @@
         var spacingTwips = pg.isOcr ? 0 : Math.round(letterSpacingPts(line) * 20);
         var x = Math.max(0, Math.min(line.x, pg.width - 20)).toFixed(1);
         var y = Math.max(0, line.y).toFixed(1);
-        /* Generous box: font substitution in Word can render text wider
-           than in the PDF, and OCR spans run tight, so a too-narrow box
-           clips the end of a line. The box is at least wide enough for
-           the estimated rendered text. Clamped so it never runs off the
-           page edge. */
-        var w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estTextWidthPt(line.text, line.size) * 1.15 + 6), pg.width - parseFloat(x) - 2)).toFixed(1);
-        var h = (line.size * 1.5).toFixed(1);
+        var w = fitted[li].w.toFixed(1);
+        var h = fitted[li].h.toFixed(1);
         var rPr = '';
         if (line.font) rPr += '<w:rFonts w:ascii="' + escapeXml(line.font) + '" w:hAnsi="' + escapeXml(line.font) + '"/>';
         if (line.bold) rPr += '<w:b/>';
         if (line.italic) rPr += '<w:i/>';
         if (spacingTwips > 0) rPr += '<w:spacing w:val="' + spacingTwips + '"/>';
-        rPr += '<w:sz w:val="' + Math.round(line.size * 2) + '"/><w:szCs w:val="' + Math.round(line.size * 2) + '"/>';
+        rPr += '<w:sz w:val="' + Math.round(fitted[li].size * 2) + '"/><w:szCs w:val="' + Math.round(fitted[li].size * 2) + '"/>';
         parts.push(
           '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="40" w:lineRule="exact"/></w:pPr>' +
           '<w:r><w:pict>' +
@@ -1126,19 +1148,20 @@
       pptx.layout = 'PDF';
       slidePages.forEach(function (pg, idx) {
         var s = pptx.addSlide();
-        pg.lines.forEach(function (line) {
+        var fitted = fitLineBoxes(pg.lines, pg.width);
+        pg.lines.forEach(function (line, li) {
           var spacing = pg.isOcr ? 0 : letterSpacingPts(line);
           var box = {
             x: Math.max(0, line.x) / 72,
             y: Math.max(0, line.y) / 72,
-            w: Math.max(0.15, Math.max(line.w * 1.2 + 12, estTextWidthPt(line.text, line.size) * 1.15 + 6) / 72),
-            h: (line.size * 1.5) / 72,
-            fontSize: Math.max(6, line.size),
+            w: Math.max(0.15, fitted[li].w / 72),
+            h: fitted[li].h / 72,
+            fontSize: Math.max(6, fitted[li].size),
             bold: !!line.bold,
             italic: !!line.italic,
             color: '000000',
             valign: 'top',
-            wrap: false,
+            wrap: fitted[li].wraps > 1,
             margin: 0
           };
           if (line.font) box.fontFace = line.font;
@@ -1860,6 +1883,7 @@
       layoutLinesFromBoxes: layoutLinesFromBoxes,
       buildLayoutDocxXml: buildLayoutDocxXml,
       letterSpacingPts: letterSpacingPts,
+      fitLineBoxes: fitLineBoxes,
       parsePptx: parsePptx,
       isNoiseLine: isNoiseLine
     }
