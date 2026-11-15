@@ -37,6 +37,13 @@
       ],
       check: function () { return !!global.mammoth; }
     },
+    docxpreview: {
+      urls: [
+        'https://cdn.jsdelivr.net/npm/docx-preview@0.3.7/dist/docx-preview.js',
+        'https://unpkg.com/docx-preview@0.3.7/dist/docx-preview.js'
+      ],
+      check: function () { return !!(global.docx && global.docx.renderAsync); }
+    },
     xlsx: {
       urls: [
         'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
@@ -1123,6 +1130,233 @@
      position, size and styling — fully editable. Page-image mode: each
      page is rendered as a picture that fills the slide — pixel-perfect,
      but not editable. */
+  /* ---- PDF graphics extraction (images + filled rectangles) ----
+     The editable-text PowerPoint mode used to carry text only, so photos
+     and colour blocks vanished. Reading the page's operator list recovers
+     them: paintImageXObject paints an image in the unit square mapped by
+     the current transform, and rectangle+fill paints a solid block. Only
+     axis-aligned graphics are kept (rotated decorations stay in the
+     page-image mode, which is pixel-exact). Coordinates come out in
+     points, y growing downward, matching the text lines. */
+  function rgbHex(c) {
+    function h(v) { var s = Math.max(0, Math.min(255, Math.round(v))).toString(16); return s.length === 1 ? '0' + s : s; }
+    return (h(c.r) + h(c.g) + h(c.b)).toUpperCase();
+  }
+  function composeAffine(m1, m2) {
+    /* Apply m2 first, then m1. */
+    return [
+      m1[0] * m2[0] + m1[2] * m2[1],
+      m1[1] * m2[0] + m1[3] * m2[1],
+      m1[0] * m2[2] + m1[2] * m2[3],
+      m1[1] * m2[2] + m1[3] * m2[3],
+      m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+      m1[1] * m2[4] + m1[3] * m2[5] + m1[5]
+    ];
+  }
+  function rgbFromColorArgs(kind, args) {
+    /* pdf.js passes colours as 0-255 integers in the operator list (older
+       versions used 0..1 floats); normalise per component either way. */
+    function n(v) { v = parseFloat(v) || 0; return v > 1 ? v / 255 : v; }
+    if (kind === 'rgb') return { r: Math.round(n(args[0]) * 255), g: Math.round(n(args[1]) * 255), b: Math.round(n(args[2]) * 255) };
+    if (kind === 'gray') { var v = Math.round(n(args[0]) * 255); return { r: v, g: v, b: v }; }
+    var r = (1 - n(args[0])) * (1 - n(args[3])), g = (1 - n(args[1])) * (1 - n(args[3])), b = (1 - n(args[2])) * (1 - n(args[3]));
+    return { r: Math.round(r * 255), g: Math.round(g * 255), b: Math.round(b * 255) };
+  }
+  /* Decode one constructPath op (pdf.js batches all path construction
+     into it): ops array + flat coordinate array. Returns { rects, pts,
+     curves } where pts are the moveTo/lineTo points in order. */
+  function decodeConstructPath(ops, coords, OPS) {
+    var rects = [], pts = [], curves = false, j = 0;
+    for (var i = 0; i < ops.length; i++) {
+      var op = ops[i] | 0;
+      if (op === OPS.rectangle) {
+        rects.push([coords[j], coords[j + 1], coords[j + 2], coords[j + 3]]);
+        j += 4;
+      } else if (op === OPS.moveTo || op === OPS.lineTo) {
+        pts.push([coords[j], coords[j + 1]]);
+        j += 2;
+      } else if (op === OPS.curveTo) { curves = true; j += 6; }
+      else if (op === OPS.curveTo2 || op === OPS.curveTo3) { curves = true; j += 4; }
+    }
+    return { rects: rects, pts: pts, curves: curves };
+  }
+  function interpretPdfOps(fnArray, argsArray, OPS, pageW, pageH) {
+    var IDENTITY = [1, 0, 0, 1, 0, 0];
+    var ctm = IDENTITY.slice();
+    var stack = [];
+    var fill = { r: 0, g: 0, b: 0 }, stroke = { r: 0, g: 0, b: 0 }, lineWidth = 1;
+    var fillAlpha = 1, strokeAlpha = 1;
+    var pathRects = [], pathPts = [], pathCurves = false;
+    var images = [], rects = [];
+    function clearPath() { pathRects = []; pathPts = []; pathCurves = false; }
+    function axisAligned(m) { return Math.abs(m[1]) < 0.01 && Math.abs(m[2]) < 0.01; }
+    function mapPoint(x, y) {
+      return [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]];
+    }
+    function intersectBox(b) {
+      var x0 = Math.max(b.x0, 0), y0 = Math.max(b.y0, 0);
+      var x1 = Math.min(b.x1, pageW), y1 = Math.min(b.y1, pageH);
+      if (x1 - x0 < 1 || y1 - y0 < 1) return null;
+      return { x0: x0, y0: y0, x1: x1, y1: y1 };
+    }
+    function boxToTopOrigin(b) {
+      return { x: b.x0, y: pageH - b.y1, w: b.x1 - b.x0, h: b.y1 - b.y0 };
+    }
+    function mapRectDevice(x, y, w, h) {
+      var p0 = mapPoint(x, y), p1 = mapPoint(x + w, y + h);
+      return { x0: Math.min(p0[0], p1[0]), y0: Math.min(p0[1], p1[1]), x1: Math.max(p0[0], p1[0]), y1: Math.max(p0[1], p1[1]) };
+    }
+    function pushRectDevice(b, doFill, doStroke) {
+      /* Transparent fills are shadows, glows and masks — painting them
+         solid would black out the slide. Only opaque paint is kept. */
+      if (doFill && fillAlpha < 0.95) doFill = false;
+      if (doStroke && strokeAlpha < 0.95) doStroke = false;
+      if (!doFill && !doStroke) return;
+      var clipped = intersectBox(b);
+      if (!clipped) return;
+      var r = boxToTopOrigin(clipped);
+      if (doFill && !doStroke && fill.r === 255 && fill.g === 255 && fill.b === 255 && r.w * r.h >= pageW * pageH * 0.95) return;
+      rects.push({ x: r.x, y: r.y, w: r.w, h: r.h, fill: doFill ? fill : null, stroke: doStroke ? stroke : null, lineWidth: lineWidth });
+    }
+    function emitPath(doFill, doStroke) {
+      if (!axisAligned(ctm)) { clearPath(); return; }
+      var i;
+      for (i = 0; i < pathRects.length; i++) {
+        var pr = pathRects[i];
+        pushRectDevice(mapRectDevice(pr[0], pr[1], pr[2], pr[3]), doFill, doStroke);
+      }
+      /* A path of straight segments that forms an axis-aligned rectangle
+         (Canva and friends draw bars as quads, not rectangle ops). */
+      if (!pathRects.length && !pathCurves && pathPts.length >= 4) {
+        var dev = pathPts.map(function (p) { return mapPoint(p[0], p[1]); });
+        var xs = dev.map(function (p) { return p[0]; }), ys = dev.map(function (p) { return p[1]; });
+        var minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+        var minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+        var corners = [[minX, minY], [minX, maxY], [maxX, minY], [maxX, maxY]];
+        var eps = 1.5;
+        var allCorners = corners.every(function (c) {
+          return dev.some(function (p) { return Math.abs(p[0] - c[0]) < eps && Math.abs(p[1] - c[1]) < eps; });
+        });
+        var onEdges = dev.every(function (p) {
+          return Math.abs(p[0] - minX) < eps || Math.abs(p[0] - maxX) < eps || Math.abs(p[1] - minY) < eps || Math.abs(p[1] - maxY) < eps;
+        });
+        if (allCorners && onEdges) {
+          pushRectDevice({ x0: minX, y0: minY, x1: maxX, y1: maxY }, doFill, doStroke);
+        }
+      }
+      clearPath();
+    }
+    for (var i = 0; i < fnArray.length; i++) {
+      var fn = fnArray[i], args = argsArray[i] || [];
+      if (fn === OPS.save) { stack.push({ ctm: ctm.slice(), fill: fill, stroke: stroke, lineWidth: lineWidth, fillAlpha: fillAlpha, strokeAlpha: strokeAlpha }); }
+      else if (fn === OPS.restore) { var s = stack.pop(); if (s) { ctm = s.ctm; fill = s.fill; stroke = s.stroke; lineWidth = s.lineWidth; fillAlpha = s.fillAlpha; strokeAlpha = s.strokeAlpha; } }
+      else if (fn === OPS.setGState) {
+        /* Graphics state carries fill/stroke alpha (ca/CA). The args are
+           nested key/value pairs; walk them defensively. */
+        (function walk(v) {
+          if (!v || typeof v !== 'object') return;
+          if (v.length === 2 && typeof v[0] === 'string') {
+            if (v[0] === 'ca') fillAlpha = parseFloat(v[1]);
+            if (v[0] === 'CA') strokeAlpha = parseFloat(v[1]);
+            return;
+          }
+          for (var k = 0; k < v.length; k++) walk(v[k]);
+        })(args);
+      }
+      else if (fn === OPS.transform) { ctm = composeAffine(ctm, args); }
+      else if (fn === OPS.setFillRGBColor) { fill = rgbFromColorArgs('rgb', args); }
+      else if (fn === OPS.setFillGray) { fill = rgbFromColorArgs('gray', args); }
+      else if (fn === OPS.setFillCMYKColor) { fill = rgbFromColorArgs('cmyk', args); }
+      else if (fn === OPS.setStrokeRGBColor) { stroke = rgbFromColorArgs('rgb', args); }
+      else if (fn === OPS.setStrokeGray) { stroke = rgbFromColorArgs('gray', args); }
+      else if (fn === OPS.setStrokeCMYKColor) { stroke = rgbFromColorArgs('cmyk', args); }
+      else if (fn === OPS.setLineWidth) { lineWidth = args[0] || 1; }
+      else if (fn === OPS.constructPath) {
+        var decoded = decodeConstructPath(args[0] || [], args[1] || [], OPS);
+        pathRects = pathRects.concat(decoded.rects);
+        pathPts = pathPts.concat(decoded.pts);
+        pathCurves = pathCurves || decoded.curves;
+      }
+      else if (fn === OPS.rectangle) { pathRects.push([args[0], args[1], args[2], args[3]]); }
+      else if (fn === OPS.moveTo || fn === OPS.lineTo) { pathPts.push([args[0], args[1]]); }
+      else if (fn === OPS.curveTo || fn === OPS.curveTo2 || fn === OPS.curveTo3) { pathCurves = true; }
+      else if (fn === OPS.fill || fn === OPS.eoFill) { emitPath(true, false); }
+      else if (fn === OPS.stroke) { emitPath(false, true); }
+      else if (fn === OPS.fillStroke || fn === OPS.eoFillStroke || fn === OPS.closeFillStroke || fn === OPS.closeEOFillStroke) { emitPath(true, true); }
+      else if (fn === OPS.closeStroke) { emitPath(false, true); }
+      else if (fn === OPS.clip || fn === OPS.eoClip) { clearPath(); /* Clip regions are not tracked: fully transparent paint is already dropped by the alpha check, and rects are clamped to the page. Tracking clip bboxes wrongly hid real bars in Canva files. */ }
+      else if (fn === OPS.endPath) { clearPath(); }
+      else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject || fn === OPS.paintJpegXObject) {
+        if (axisAligned(ctm)) {
+          var ib = mapRectDevice(0, 0, 1, 1);
+          var vis = intersectBox(ib);
+          /* Keep the image only if most of it is actually visible —
+             heavily clipped images are masks and decorations. */
+          if (vis && (vis.x1 - vis.x0) * (vis.y1 - vis.y0) >= 0.5 * (ib.x1 - ib.x0) * (ib.y1 - ib.y0)) {
+            var ir = boxToTopOrigin(ib);
+            if (ir.w >= 2 && ir.h >= 2) images.push({ x: ir.x, y: ir.y, w: ir.w, h: ir.h, objId: args[0] });
+          }
+        }
+      }
+    }
+    /* Drop exact duplicates (painted backgrounds often repeat). */
+    var seen = {};
+    rects = rects.filter(function (r) {
+      var k = [Math.round(r.x), Math.round(r.y), Math.round(r.w), Math.round(r.h), r.fill && (r.fill.r + ',' + r.fill.g + ',' + r.fill.b)].join('|');
+      if (seen[k]) return false;
+      seen[k] = true; return true;
+    });
+    return { images: images, rects: rects };
+  }
+  function getPdfObj(page, objId, timeoutMs) {
+    return new Promise(function (resolve) {
+      var done = false;
+      var timer = setTimeout(function () { if (!done) { done = true; resolve(null); } }, timeoutMs || 5000);
+      try {
+        page.objs.get(objId, function (data) {
+          if (!done) { done = true; clearTimeout(timer); resolve(data || null); }
+        });
+      } catch (e) { if (!done) { done = true; clearTimeout(timer); resolve(null); } }
+    });
+  }
+  function imageDataToDataUrl(img) {
+    if (!img || typeof document === 'undefined') return null;
+    try {
+      var w = img.width, h = img.height;
+      if (!w || !h) return null;
+      var canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      var ctx = canvas.getContext('2d');
+      if (img.bitmap) { ctx.drawImage(img.bitmap, 0, 0); }
+      else if (img.data && img.data.length >= w * h * 4) {
+        ctx.putImageData(new global.ImageData(new Uint8ClampedArray(img.data.buffer, img.data.byteOffset, w * h * 4), w, h), 0, 0);
+      } else if (img.data && img.data.length >= w * h * 3) {
+        var rgba = new Uint8ClampedArray(w * h * 4);
+        for (var i = 0, j = 0; i < w * h; i++, j += 3) {
+          rgba[i * 4] = img.data[j]; rgba[i * 4 + 1] = img.data[j + 1]; rgba[i * 4 + 2] = img.data[j + 2]; rgba[i * 4 + 3] = 255;
+        }
+        ctx.putImageData(new global.ImageData(rgba, w, h), 0, 0);
+      } else if (img.data && img.data.length === w * h) {
+        var gray = new Uint8ClampedArray(w * h * 4);
+        for (var k = 0; k < w * h; k++) { gray[k * 4] = img.data[k]; gray[k * 4 + 1] = img.data[k]; gray[k * 4 + 2] = img.data[k]; gray[k * 4 + 3] = 255; }
+        ctx.putImageData(new global.ImageData(gray, w, h), 0, 0);
+      } else { return null; }
+      return canvas.toDataURL('image/png');
+    } catch (e) { return null; }
+  }
+  async function extractPageGraphics(page, pageW, pageH) {
+    var opList = await page.getOperatorList();
+    var OPS = global.pdfjsLib.OPS;
+    var found = interpretPdfOps(opList.fnArray, opList.argsArray, OPS, pageW, pageH);
+    var images = [];
+    for (var i = 0; i < found.images.length; i++) {
+      var im = found.images[i];
+      var data = await getPdfObj(page, im.objId, 5000);
+      var dataUrl = data ? imageDataToDataUrl(data) : null;
+      if (dataUrl) images.push({ x: im.x, y: im.y, w: im.w, h: im.h, dataUrl: dataUrl });
+    }
+    return { images: images, rects: found.rects };
+  }
   async function toolPdfToPptx(files, opts, prog) {
     needLib('pptxgenjs');
     var file = files[0]; assertSize(file);
@@ -1169,8 +1403,33 @@
       var first = slidePages[0];
       pptx.defineLayout({ name: 'PDF', width: first.width / 72, height: first.height / 72 });
       pptx.layout = 'PDF';
+      /* Photos and colour blocks from the PDF, placed at their original
+         positions behind the text — the slide keeps its look, not just
+         its words. A failure here never blocks the text conversion. */
+      var graphics = [];
+      try {
+        var gpdf = await loadPdfJs(file);
+        for (var gp = 1; gp <= gpdf.numPages; gp++) {
+          var gpage = await gpdf.getPage(gp);
+          var gvp = gpage.getViewport({ scale: 1 });
+          graphics.push(await extractPageGraphics(gpage, gvp.width, gvp.height));
+        }
+      } catch (gErr) { graphics = []; }
       slidePages.forEach(function (pg, idx) {
         var s = pptx.addSlide();
+        var g = graphics[idx];
+        if (g) {
+          g.rects.forEach(function (r) {
+            var shapeOpts = { x: r.x / 72, y: r.y / 72, w: r.w / 72, h: r.h / 72 };
+            if (r.fill) shapeOpts.fill = { color: rgbHex(r.fill) };
+            if (r.stroke) shapeOpts.line = { color: rgbHex(r.stroke), width: Math.max(0.5, r.lineWidth) };
+            else shapeOpts.line = { type: 'none' };
+            try { s.addShape(pptx.ShapeType.rect, shapeOpts); } catch (e) { /* skip */ }
+          });
+          g.images.forEach(function (im) {
+            try { s.addImage({ data: im.dataUrl, x: im.x / 72, y: im.y / 72, w: im.w / 72, h: im.h / 72 }); } catch (e) { /* skip */ }
+          });
+        }
         var fitted = fitLineBoxes(pg.lines, pg.width);
         pg.lines.forEach(function (line, li) {
           var spacing = pg.isOcr ? 0 : letterSpacingPts(line);
@@ -1239,23 +1498,120 @@
   }
 
   /* ================= Convert TO pdf ================= */
-  async function toolWordToPdf(files, opts, prog) {
-    needLib('mammoth');
-    var file = files[0]; assertSize(file);
-    prog(0.15, 'Reading the Word document...');
-    var buf = await readArrayBuffer(file);
-    var res = await global.mammoth.convertToHtml({ arrayBuffer: buf });
-    if (!res.value || !res.value.replace(/<[^>]+>/g, '').trim()) {
-      throw new Error('This Word document appears to be empty, or its content could not be read.');
+  /* Render an already-laid-out DOM container (A4 width, 794px at 96dpi)
+     to a PDF, cutting pages BETWEEN block elements so no line of text is
+     ever split across a page boundary. Each slice keeps the document's
+     own margins, so the PDF looks like the document, not a reflow. */
+  async function htmlContainerToPdf(container, prog) {
+    needLib('html2canvas'); needLib('jspdf');
+    var imgs = container.querySelectorAll('img');
+    await Promise.all(Array.prototype.map.call(imgs, function (img) {
+      if (img.complete) return Promise.resolve();
+      return new Promise(function (res) {
+        var done = function () { res(); };
+        img.addEventListener('load', done, { once: true });
+        img.addEventListener('error', done, { once: true });
+        setTimeout(done, 5000);
+      });
+    }));
+    var canvas = await global.html2canvas(container, { scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false });
+    var pageW = 595.28, pageH = 841.89;
+    var pxPerPt = canvas.width / pageW;
+    var sliceHpx = Math.floor(pageH * pxPerPt);
+    /* Cut points: bottom edges of top-level blocks, in canvas pixels. */
+    var cRect = container.getBoundingClientRect();
+    var blocks = [];
+    var sections = container.querySelectorAll('.docx-section');
+    var scopes = sections.length ? sections : [container];
+    Array.prototype.forEach.call(scopes, function (scope) {
+      Array.prototype.forEach.call(scope.children, function (el) {
+        var r = el.getBoundingClientRect();
+        if (r.height > 0) blocks.push((r.bottom - cRect.top) * 2);
+      });
+    });
+    blocks.sort(function (a, b) { return a - b; });
+    var cuts = [0];
+    var bandEnd = sliceHpx;
+    while (bandEnd < canvas.height) {
+      var cut = bandEnd;
+      for (var i = blocks.length - 1; i >= 0; i--) {
+        if (blocks[i] > cuts[cuts.length - 1] + 40 && blocks[i] <= bandEnd) { cut = Math.floor(blocks[i]); break; }
+      }
+      cuts.push(cut);
+      bandEnd = cut + sliceHpx;
     }
-    prog(0.45, 'Laying out the pages...');
-    var styled = '<div style="font-family:Georgia,serif">' + res.value + '</div>';
-    var wrapped = '<style>h1{font-size:24px}h2{font-size:19px}h3{font-size:16px}' +
-      'table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px 8px;text-align:left}' +
-      'img{max-width:100%;height:auto}p{margin:0 0 12px}</style>' + styled;
-    var blob = await htmlStringToPdf(wrapped, {});
+    cuts.push(canvas.height);
+    var doc = new global.jspdf.jsPDF({ unit: 'pt', format: 'a4', orientation: 'portrait', compress: true });
+    for (var p = 0; p < cuts.length - 1; p++) {
+      var top = cuts[p], h = cuts[p + 1] - top;
+      if (h <= 0) continue;
+      var slice = document.createElement('canvas');
+      slice.width = canvas.width; slice.height = h;
+      slice.getContext('2d').drawImage(canvas, 0, top, canvas.width, h, 0, 0, canvas.width, h);
+      if (p > 0) doc.addPage();
+      doc.addImage(slice.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pageW, h / pxPerPt);
+      if (prog) prog(0.5 + (p + 1) / (cuts.length - 1) * 0.45, 'Writing page ' + (p + 1) + '...');
+    }
+    return doc.output('blob');
+  }
+
+  async function toolWordToPdf(files, opts, prog) {
+    var file = files[0]; assertSize(file);
+    prog(0.1, 'Reading the Word document...');
+    var buf = await readArrayBuffer(file);
+    var usedFallback = false;
+    var blob = null;
+    try {
+      await loadLib('docxpreview');
+      needLib('docxpreview'); needLib('html2canvas'); needLib('jspdf');
+      var container = document.createElement('div');
+      container.style.cssText = 'position:absolute;left:-10000px;top:0;width:794px;background:#ffffff;';
+      document.body.appendChild(container);
+      try {
+        await global.docx.renderAsync(buf.slice(0), container);
+        if (!container.textContent.trim() && !container.querySelector('img, table')) {
+          throw new Error('empty render');
+        }
+        prog(0.4, 'Laying out the pages...');
+        blob = await htmlContainerToPdf(container, prog);
+      } finally {
+        container.remove();
+      }
+    } catch (e) {
+      /* Compatibility mode: mammoth keeps the text, tables, lists and
+         images (as embedded pictures), with simpler styling. */
+      usedFallback = true;
+      await loadLib('mammoth');
+      needLib('mammoth');
+      var res = await global.mammoth.convertToHtml({
+        arrayBuffer: buf.slice(0),
+        convertImage: global.mammoth.images.imgElement(function (image) {
+          return image.read('base64').then(function (b64) {
+            return { src: 'data:' + image.contentType + ';base64,' + b64 };
+          });
+        })
+      });
+      if (!res.value || !res.value.replace(/<[^>]+>/g, '').trim()) {
+        throw new Error('This Word document appears to be empty, or its content could not be read.');
+      }
+      var wrap = document.createElement('div');
+      wrap.style.cssText = 'position:absolute;left:-10000px;top:0;width:794px;background:#ffffff;color:#111111;' +
+        'font-family:Calibri,Arial,sans-serif;font-size:14px;line-height:1.6;padding:72px;box-sizing:border-box;';
+      wrap.innerHTML = '<style>h1{font-size:24px}h2{font-size:19px}h3{font-size:16px}' +
+        'table{border-collapse:collapse;width:100%}td,th{border:1px solid #999;padding:6px 8px;text-align:left}' +
+        'img{max-width:100%;height:auto}p{margin:0 0 12px}</style>' + res.value;
+      document.body.appendChild(wrap);
+      try {
+        prog(0.45, 'Laying out the pages...');
+        blob = await htmlContainerToPdf(wrap, prog);
+      } finally {
+        wrap.remove();
+      }
+    }
     prog(1, 'Done');
-    return { files: [{ name: baseOf(file.name) + '.pdf', blob: blob }] };
+    var result = { files: [{ name: baseOf(file.name) + '.pdf', blob: blob }] };
+    if (usedFallback) result.note = 'Rendered in compatibility mode (the high-fidelity renderer could not load), so some formatting may differ from Word. Images and tables are kept.';
+    return result;
   }
 
   async function toolExcelToPdf(files, opts, prog) {
@@ -1587,6 +1943,17 @@
     var box = shapeBox(spPr, tf) || { x: 0, y: 0, w: 100, h: 50 };
     var fill = spPr ? solidFillColor(spPr) : null;
     if (spPr && elChild(spPr, 'noFill')) fill = null;
+    var geom = 'rect', line = null;
+    if (spPr) {
+      var prst = elChild(spPr, 'prstGeom');
+      if (prst && prst.getAttribute('prst')) geom = prst.getAttribute('prst');
+      var ln = elChild(spPr, 'ln');
+      if (ln && !elChild(ln, 'noFill')) {
+        var lc = solidFillColor(ln);
+        var lw = ln.getAttribute('w') ? parseFloat(ln.getAttribute('w')) / EMU_PER_PT : 1;
+        if (lc) line = { color: lc, width: Math.max(0.5, lw) };
+      }
+    }
     var txBody = elChild(el, 'txBody');
     var paras = [];
     var anchor = 't', wrap = true;
@@ -1603,7 +1970,72 @@
       }
       elChildren(txBody, 'p').forEach(function (pEl) { paras.push(parseSlideParagraph(pEl)); });
     }
-    return { kind: 'text', box: box, fill: fill, paras: paras, anchor: anchor, wrap: wrap, insets: insets };
+    return { kind: 'text', box: box, fill: fill, geom: geom, line: line, paras: paras, anchor: anchor, wrap: wrap, insets: insets };
+  }
+  /* Tables live in graphicFrames: <a:tbl> with a grid, rows and cells.
+     Charts and diagrams share the graphicFrame element, so only frames
+     that actually contain a table become table shapes. */
+  function parseTableShape(el, tf) {
+    var tbl = elDescendants(el, 'tbl')[0];
+    if (!tbl) return { kind: 'unsupported' };
+    var box = shapeBox(el, tf);
+    if (!box) return { kind: 'unsupported' };
+    var grid = [];
+    var gridEl = elChild(tbl, 'tblGrid');
+    if (gridEl) elChildren(gridEl, 'gridCol').forEach(function (gc) {
+      grid.push((parseFloat(gc.getAttribute('w')) || 0) / EMU_PER_PT * tf.sx);
+    });
+    var tblPr = elChild(tbl, 'tblPr');
+    var firstRow = tblPr && tblPr.getAttribute('firstRow') !== '0';
+    var rows = [];
+    elChildren(tbl, 'tr').forEach(function (tr) {
+      var rowH = (parseFloat(tr.getAttribute('h')) || 0) / EMU_PER_PT * tf.sy;
+      var cells = [];
+      elChildren(tr, 'tc').forEach(function (tc) {
+        var tcPr = elChild(tc, 'tcPr');
+        var span = tcPr && tcPr.getAttribute('gridSpan') ? parseInt(tcPr.getAttribute('gridSpan'), 10) : 1;
+        var cellFill = tcPr ? solidFillColor(tcPr) : null;
+        var text = '', size = 12, bold = false, color = null, align = 'left';
+        var txBody = elChild(tc, 'txBody');
+        if (txBody) {
+          var parts = [];
+          elChildren(txBody, 'p').forEach(function (pEl) {
+            var para = parseSlideParagraph(pEl);
+            align = para.align;
+            para.runs.forEach(function (r) {
+              if (r.br) { parts.push('\n'); return; }
+              parts.push(r.text);
+              if (r.size && r.size !== 18) size = r.size;
+              if (r.bold) bold = true;
+              if (r.color) color = r.color;
+            });
+            parts.push('\n');
+          });
+          text = parts.join('').replace(/\n+$/, '');
+        }
+        cells.push({ text: text, size: size, bold: bold, color: color, align: align, fill: cellFill, span: span });
+      });
+      rows.push({ h: rowH, cells: cells });
+    });
+    if (!rows.length || !grid.length) return { kind: 'unsupported' };
+    return { kind: 'table', box: box, grid: grid, rows: rows, firstRow: !!firstRow };
+  }
+  function parseConnectorShape(el, tf) {
+    var spPr = elChild(el, 'spPr');
+    var box = shapeBox(spPr, tf) || { x: 0, y: 0, w: 100, h: 0 };
+    var xfrm = spPr && elChild(spPr, 'xfrm');
+    var flipH = xfrm && xfrm.getAttribute('flipH') === '1';
+    var flipV = xfrm && xfrm.getAttribute('flipV') === '1';
+    var line = null;
+    if (spPr) {
+      var ln = elChild(spPr, 'ln');
+      if (ln && !elChild(ln, 'noFill')) {
+        var lc = solidFillColor(ln) || { r: 0, g: 0, b: 0 };
+        var lw = ln.getAttribute('w') ? parseFloat(ln.getAttribute('w')) / EMU_PER_PT : 1;
+        line = { color: lc, width: Math.max(0.5, lw) };
+      }
+    }
+    return { kind: 'line', box: box, flipH: !!flipH, flipV: !!flipV, line: line || { color: { r: 0, g: 0, b: 0 }, width: 1 } };
   }
   function parsePicShape(el, tf, rels, dir) {
     var spPr = elChild(el, 'spPr');
@@ -1641,8 +2073,10 @@
         out.push(parseTextShape(el, tf));
       } else if (ln === 'pic') {
         out.push(parsePicShape(el, tf, rels, dir));
+      } else if (ln === 'cxnSp') {
+        out.push(parseConnectorShape(el, tf));
       } else if (ln === 'graphicFrame') {
-        out.push({ kind: 'unsupported' });
+        out.push(parseTableShape(el, tf));
       }
     }
   }
@@ -1769,9 +2203,66 @@
     });
     flush();
   }
+  function drawShapeGeometry(doc, box, geom, fill, line) {
+    var style = (fill && line) ? 'FD' : (fill ? 'F' : (line ? 'D' : null));
+    if (!style) return;
+    if (fill) doc.setFillColor(fill.r, fill.g, fill.b);
+    if (line) { doc.setDrawColor(line.color.r, line.color.g, line.color.b); doc.setLineWidth(line.width); }
+    if (geom === 'ellipse') {
+      doc.ellipse(box.x + box.w / 2, box.y + box.h / 2, box.w / 2, box.h / 2, style);
+    } else if (geom === 'roundRect' || geom === 'roundSameRect' || geom === 'round1Rect' || geom === 'round2DiagRect' || geom === 'round2SameRect') {
+      var r = Math.min(box.w, box.h) * 0.12;
+      doc.roundedRect(box.x, box.y, box.w, box.h, r, r, style);
+    } else if (geom === 'line') {
+      if (line) { doc.setDrawColor(line.color.r, line.color.g, line.color.b); doc.setLineWidth(line.width); doc.line(box.x, box.y + box.h / 2, box.x + box.w, box.y + box.h / 2); }
+    } else {
+      doc.rect(box.x, box.y, box.w, box.h, style);
+    }
+  }
+  function renderTableShape(doc, sh) {
+    var box = sh.box;
+    var x = box.x, y = box.y;
+    var colX = [x];
+    sh.grid.forEach(function (gw) { colX.push(colX[colX.length - 1] + gw); });
+    var totalW = colX[colX.length - 1] - x;
+    if (totalW <= 0) return;
+    var rowH = sh.rows.map(function (r) { return r.h > 0 ? r.h : 20; });
+    sh.rows.forEach(function (row, ri) {
+      var rh = rowH[ri];
+      var cx = x;
+      row.cells.forEach(function (cell, ci) {
+        var span = Math.max(1, cell.span || 1);
+        var cw = 0;
+        for (var s = 0; s < span && ci + s < sh.grid.length; s++) cw += sh.grid[ci + s];
+        if (cw <= 0) cw = totalW / row.cells.length;
+        var fill = cell.fill || (sh.firstRow && ri === 0 ? { r: 217, g: 226, b: 243 } : null);
+        if (fill) { doc.setFillColor(fill.r, fill.g, fill.b); doc.rect(cx, y, cw, rh, 'F'); }
+        doc.setDrawColor(160, 160, 160); doc.setLineWidth(0.5); doc.rect(cx, y, cw, rh, 'D');
+        if (cell.text) {
+          var size = cell.size || 12;
+          doc.setFont('helvetica', cell.bold || (sh.firstRow && ri === 0) ? 'bold' : 'normal');
+          doc.setFontSize(size);
+          if (cell.color) doc.setTextColor(cell.color.r, cell.color.g, cell.color.b); else doc.setTextColor(0, 0, 0);
+          var pad = 6;
+          var lines = doc.splitTextToSize(cell.text, Math.max(10, cw - pad * 2));
+          var lh = size * 1.25;
+          var ty = y + pad + size * 0.8;
+          var maxLines = Math.max(1, Math.floor((rh - pad) / lh));
+          lines.slice(0, maxLines).forEach(function (ln, li) {
+            var tx = cx + pad;
+            if (cell.align === 'center') tx = cx + cw / 2 - doc.getTextWidth(ln) / 2;
+            else if (cell.align === 'right') tx = cx + cw - pad - doc.getTextWidth(ln);
+            doc.text(ln, tx, ty + li * lh);
+          });
+        }
+        cx += cw;
+      });
+      y += rh;
+    });
+  }
   function renderTextShape(doc, sh) {
     var box = sh.box;
-    if (sh.fill) { doc.setFillColor(sh.fill.r, sh.fill.g, sh.fill.b); doc.rect(box.x, box.y, box.w, box.h, 'F'); }
+    drawShapeGeometry(doc, box, sh.geom || 'rect', sh.fill, sh.line);
     var x0 = box.x + sh.insets.l, y0 = box.y + sh.insets.t;
     var w = Math.max(10, box.w - sh.insets.l - sh.insets.r);
     var h = Math.max(10, box.h - sh.insets.t - sh.insets.b);
@@ -1829,6 +2320,16 @@
       if (slide.bg) { doc.setFillColor(slide.bg.r, slide.bg.g, slide.bg.b); doc.rect(0, 0, model.width, model.height, 'F'); }
       slide.shapes.forEach(function (sh) {
         if (sh.kind === 'text') renderTextShape(doc, sh);
+        else if (sh.kind === 'table') renderTableShape(doc, sh);
+        else if (sh.kind === 'line') {
+          doc.setDrawColor(sh.line.color.r, sh.line.color.g, sh.line.color.b);
+          doc.setLineWidth(sh.line.width);
+          var x1 = sh.flipH ? sh.box.x + sh.box.w : sh.box.x;
+          var x2 = sh.flipH ? sh.box.x : sh.box.x + sh.box.w;
+          var y1 = sh.flipV ? sh.box.y + sh.box.h : sh.box.y;
+          var y2 = sh.flipV ? sh.box.y : sh.box.y + sh.box.h;
+          doc.line(x1, y1, x2, y2);
+        }
         else if (sh.kind === 'pic' && sh.dataUrl) {
           try { doc.addImage(sh.dataUrl, sh.imgFormat, sh.box.x, sh.box.y, sh.box.w, sh.box.h); } catch (e) { /* skip a broken picture */ }
         }
@@ -1838,7 +2339,7 @@
     var blob = doc.output('blob');
     var note = null;
     if (model.skipped) {
-      note = model.skipped + ' chart/table shape(s) could not be drawn — charts, tables and SmartArt need a full presentation renderer and are not rendered in this version.';
+      note = model.skipped + ' chart/SmartArt shape(s) could not be drawn — charts and SmartArt need a full presentation renderer and are not rendered in this version.';
     }
     var result = { files: [{ name: baseOf(file.name) + '.pdf', blob: blob }] };
     if (note) result.note = note;
@@ -1859,7 +2360,7 @@
     'pdf-to-text': { libs: ['pdfjs'], run: toolPdfToText },
     'pdf-to-excel': { libs: ['pdfjs', 'xlsx'], run: toolPdfToExcel },
     'pdf-to-powerpoint': { libs: ['pdfjs', 'pptxgenjs'], run: toolPdfToPptx },
-    'word-to-pdf': { libs: ['mammoth', 'html2canvas', 'jspdf'], run: toolWordToPdf },
+    'word-to-pdf': { libs: ['docxpreview', 'html2canvas', 'jspdf'], run: toolWordToPdf },
     'excel-to-pdf': { libs: ['xlsx', 'html2canvas', 'jspdf'], run: toolExcelToPdf },
     'jpg-to-pdf': { libs: ['jspdf'], run: toolImagesToPdf },
     'txt-to-pdf': { libs: ['jspdf'], run: toolTextToPdf },
@@ -1908,6 +2409,7 @@
       letterSpacingPts: letterSpacingPts,
       fitLineBoxes: fitLineBoxes,
       parsePptx: parsePptx,
+      interpretPdfOps: interpretPdfOps,
       isNoiseLine: isNoiseLine
     }
   };
