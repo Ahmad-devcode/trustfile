@@ -1562,6 +1562,9 @@
     var usedFallback = false;
     var blob = null;
     try {
+      /* docx-preview needs JSZip loaded first: its bundle takes
+         window.JSZip as a factory argument when it loads. */
+      await loadLib('jszip');
       await loadLib('docxpreview');
       needLib('docxpreview'); needLib('html2canvas'); needLib('jspdf');
       var container = document.createElement('div');
@@ -1610,7 +1613,7 @@
     }
     prog(1, 'Done');
     var result = { files: [{ name: baseOf(file.name) + '.pdf', blob: blob }] };
-    if (usedFallback) result.note = 'Rendered in compatibility mode (the high-fidelity renderer could not load), so some formatting may differ from Word. Images and tables are kept.';
+    if (usedFallback) result.note = 'Rendered in compatibility mode (the high-fidelity renderer could not be used for this file), so some formatting may differ from Word. Images and tables are kept.';
     return result;
   }
 
@@ -2360,7 +2363,7 @@
     'pdf-to-text': { libs: ['pdfjs'], run: toolPdfToText },
     'pdf-to-excel': { libs: ['pdfjs', 'xlsx'], run: toolPdfToExcel },
     'pdf-to-powerpoint': { libs: ['pdfjs', 'pptxgenjs'], run: toolPdfToPptx },
-    'word-to-pdf': { libs: ['docxpreview', 'html2canvas', 'jspdf'], run: toolWordToPdf },
+    'word-to-pdf': { libs: ['jszip', 'docxpreview', 'html2canvas', 'jspdf'], run: toolWordToPdf },
     'excel-to-pdf': { libs: ['xlsx', 'html2canvas', 'jspdf'], run: toolExcelToPdf },
     'jpg-to-pdf': { libs: ['jspdf'], run: toolImagesToPdf },
     'txt-to-pdf': { libs: ['jspdf'], run: toolTextToPdf },
