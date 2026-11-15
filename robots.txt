@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://ahmad-devcode.github.io/trustfile/sitemap.xml
+Sitemap: https://trustfile-sigma.vercel.app/sitemap.xml

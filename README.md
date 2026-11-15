@@ -2,7 +2,7 @@
 
 Free online file converter - 100% client-side. Files never leave the user's device.
 
-Live site: https://ahmad-devcode.github.io/trustfile/
+Live site: https://trustfile-sigma.vercel.app/
 
 ## Structure
 - `index.html` - homepage + all tools
@@ -15,4 +15,4 @@ Live site: https://ahmad-devcode.github.io/trustfile/
 PDF to Word extracts text (layout not preserved). Scanned PDFs need OCR (not supported). PPTX to PDF and Word to PDF with exact layout need a server and are not offered.
 
 ## Deploy
-GitHub Pages serves this repo from the `main` branch. No build step.
+Vercel serves this repo from the `main` branch (auto-deploys on every push). No build step.
