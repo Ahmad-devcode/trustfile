@@ -458,7 +458,7 @@
     /* Headings read bold even when the font name does not say so. */
     var sizes = styled.map(function (l) { return l.size; }).sort(function (a, b) { return a - b; });
     var median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 11;
-    styled.forEach(function (l) { if (l.size >= median * 1.35) l.bold = true; });
+    styled.forEach(function (l) { if (l.size >= median * 1.25) l.bold = true; });
     return styled;
   }
 
@@ -551,14 +551,35 @@
     pages.forEach(function (pg, pi) {
       pg.lines.forEach(function (line) {
         shapeId++;
-        var x = Math.max(0, line.x).toFixed(1);
+        /* Letter-spaced headings (common in CV templates: "C O N T A C T")
+           store their spacing as glyph positions, not characters, so the
+           extracted text looks joined in Word. When a line's span is much
+           wider than its text, spread the letters with character spacing
+           so it looks the way it did in the PDF. */
+        var chars = line.text.replace(/ /g, '').length;
+        var spaces = line.text.length - chars;
+        var letters = (line.text.match(/[A-Za-z]/g) || []).length;
+        var caps = (line.text.match(/[A-Z]/g) || []).length;
+        var capsRatio = letters ? caps / letters : 0;
+        var charFactor = 0.5 + 0.18 * capsRatio; /* capitals are wider */
+        var expected = (chars * charFactor + spaces * 0.25) * line.size;
+        var spacingTwips = 0;
+        if (chars >= 3 && line.w > expected * 1.25) {
+          var gaps = Math.max(1, line.text.length - 1);
+          spacingTwips = Math.min(160, Math.max(0, Math.round((line.w - expected) / gaps * 20)));
+        }
+        var x = Math.max(0, Math.min(line.x, pg.width - 20)).toFixed(1);
         var y = Math.max(0, line.y).toFixed(1);
-        var w = Math.max(10, line.w * 1.05 + 6).toFixed(1);
-        var h = (line.size * 1.3).toFixed(1);
+        /* Generous box: font substitution in Word can render text wider
+           than in the PDF, and a too-narrow box clips the end of a line.
+           Clamped so the box never runs off the page edge. */
+        var w = Math.max(10, Math.min(line.w * 1.2 + 12, pg.width - parseFloat(x) - 2)).toFixed(1);
+        var h = (line.size * 1.5).toFixed(1);
         var rPr = '';
         if (line.font) rPr += '<w:rFonts w:ascii="' + escapeXml(line.font) + '" w:hAnsi="' + escapeXml(line.font) + '"/>';
         if (line.bold) rPr += '<w:b/>';
         if (line.italic) rPr += '<w:i/>';
+        if (spacingTwips > 0) rPr += '<w:spacing w:val="' + spacingTwips + '"/>';
         rPr += '<w:sz w:val="' + Math.round(line.size * 2) + '"/><w:szCs w:val="' + Math.round(line.size * 2) + '"/>';
         parts.push(
           '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="40" w:lineRule="exact"/></w:pPr>' +
