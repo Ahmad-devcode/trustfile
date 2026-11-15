@@ -452,7 +452,7 @@
        real text. Real words on readable scans score well above this. */
     var usable = isOcr ? boxes.filter(function (b) { return b.conf === undefined || b.conf >= 30; }) : boxes;
     if (isOcr && usable.length && usable.length < boxes.length) boxes = usable;
-    var lines = groupLines(boxes);
+    var lines = mergeRowFragments(groupLines(boxes));
     var styled = lines.map(function (line) {
       var words = line.boxes.slice().sort(function (a, b) { return a.x0 - b.x0; });
       var text = words.map(function (b) { return b.text; }).join(' ').replace(/\s+/g, ' ').trim();
@@ -467,7 +467,7 @@
       var font = '';
       Object.keys(fonts).forEach(function (f) { if (!font || fonts[f] > fonts[font]) font = f; });
       return { text: text, x: line.x0, y: line.y0, w: Math.max(10, line.x1 - line.x0), size: size || 11, bold: bold, italic: italic, font: font };
-    }).filter(function (l) { return l.text !== '' && (!isOcr || !isNoiseLine(l.text)); });
+    }).filter(function (l) { return l.text !== '' && (!isOcr || (!isNoiseLine(l.text) && !isFragmentLine(l.text))); });
     /* Headings read bold even when the font name does not say so. */
     var sizes = styled.map(function (l) { return l.size; }).sort(function (a, b) { return a - b; });
     var median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 11;
@@ -557,6 +557,18 @@
      positioned text box at its original PDF coordinates, on a page of
      the PDF's own size, with its font size, bold/italic and font kept.
      Text stays fully editable — each box holds real text, not an image. */
+  /* Rough rendered width of a line of text (points), for box sizing and
+     letter-spacing detection. Capitals are wider than lowercase. */
+  function estTextWidthPt(text, size) {
+    var chars = text.replace(/ /g, '').length;
+    var spaces = text.length - chars;
+    var letters = (text.match(/[A-Za-z]/g) || []).length;
+    var caps = (text.match(/[A-Z]/g) || []).length;
+    var capsRatio = letters ? caps / letters : 0;
+    var charFactor = 0.5 + 0.18 * capsRatio;
+    return (chars * charFactor + spaces * 0.25) * size;
+  }
+
   /* Letter-spaced headings (common in CV templates: "C O N T A C T") store
      their spacing as glyph positions, not characters, so the extracted
      text looks joined in Word/PowerPoint. When a line's span is much
@@ -564,15 +576,49 @@
      so it can be rendered spread out the way it looked in the PDF. */
   function letterSpacingPts(line) {
     var chars = line.text.replace(/ /g, '').length;
-    var spaces = line.text.length - chars;
-    var letters = (line.text.match(/[A-Za-z]/g) || []).length;
-    var caps = (line.text.match(/[A-Z]/g) || []).length;
-    var capsRatio = letters ? caps / letters : 0;
-    var charFactor = 0.5 + 0.18 * capsRatio; /* capitals are wider */
-    var expected = (chars * charFactor + spaces * 0.25) * line.size;
+    var expected = estTextWidthPt(line.text, line.size);
     if (chars < 3 || line.w <= expected * 1.25) return 0;
     var gaps = Math.max(1, line.text.length - 1);
     return Math.min(8, Math.max(0, (line.w - expected) / gaps));
+  }
+
+  /* Fragments OCR reads from rules, borders and photos ("mm eo", "_ — mm"):
+     no word longer than 2 letters, at most 3 words, almost no letters. */
+  function isFragmentLine(text) {
+    var words = String(text).trim().split(/\s+/).filter(Boolean);
+    if (!words.length || words.length > 3) return false;
+    var alnum = (String(text).match(/[A-Za-z0-9]/g) || []).length;
+    if (alnum > 6) return false;
+    return words.every(function (w) { return (w.match(/[A-Za-z0-9]/g) || []).length <= 2; });
+  }
+
+  /* Merge fragments of one visual row that grouping split apart: words in
+     different sizes sit on the same baseline but their boxes overlap too
+     little in height to group, so they render on top of each other
+     ("3 yearxperience"). Only merges when baselines align AND the boxes
+     touch or overlap horizontally — justified text and columns keep
+     their gaps, so they are never merged. */
+  function mergeRowFragments(lines) {
+    var sorted = lines.slice().sort(function (a, b) { return (a.y0 - b.y0) || (a.x0 - b.x0); });
+    var merged = [];
+    sorted.forEach(function (line) {
+      var target = null;
+      for (var i = merged.length - 1; i >= 0 && i >= merged.length - 3; i--) {
+        var m = merged[i];
+        var maxH = Math.max(m.y1 - m.y0, line.y1 - line.y0);
+        var baselineDiff = Math.abs(m.y1 - line.y1);
+        var xGap = line.x0 >= m.x1 ? line.x0 - m.x1 : (line.x1 <= m.x0 ? m.x0 - line.x1 : 0);
+        if (baselineDiff <= maxH * 0.35 && xGap < 3) { target = m; break; }
+      }
+      if (target) {
+        target.boxes = target.boxes.concat(line.boxes);
+        target.x0 = Math.min(target.x0, line.x0); target.x1 = Math.max(target.x1, line.x1);
+        target.y0 = Math.min(target.y0, line.y0); target.y1 = Math.max(target.y1, line.y1);
+      } else {
+        merged.push(line);
+      }
+    });
+    return merged;
   }
 
   function buildLayoutDocxXml(pages) {
@@ -589,9 +635,11 @@
         var x = Math.max(0, Math.min(line.x, pg.width - 20)).toFixed(1);
         var y = Math.max(0, line.y).toFixed(1);
         /* Generous box: font substitution in Word can render text wider
-           than in the PDF, and a too-narrow box clips the end of a line.
-           Clamped so the box never runs off the page edge. */
-        var w = Math.max(10, Math.min(line.w * 1.2 + 12, pg.width - parseFloat(x) - 2)).toFixed(1);
+           than in the PDF, and OCR spans run tight, so a too-narrow box
+           clips the end of a line. The box is at least wide enough for
+           the estimated rendered text. Clamped so it never runs off the
+           page edge. */
+        var w = Math.max(10, Math.min(Math.max(line.w * 1.2 + 12, estTextWidthPt(line.text, line.size) * 1.15 + 6), pg.width - parseFloat(x) - 2)).toFixed(1);
         var h = (line.size * 1.5).toFixed(1);
         var rPr = '';
         if (line.font) rPr += '<w:rFonts w:ascii="' + escapeXml(line.font) + '" w:hAnsi="' + escapeXml(line.font) + '"/>';
@@ -1083,7 +1131,7 @@
           var box = {
             x: Math.max(0, line.x) / 72,
             y: Math.max(0, line.y) / 72,
-            w: Math.max(0.15, (line.w * 1.2 + 12) / 72),
+            w: Math.max(0.15, Math.max(line.w * 1.2 + 12, estTextWidthPt(line.text, line.size) * 1.15 + 6) / 72),
             h: (line.size * 1.5) / 72,
             fontSize: Math.max(6, line.size),
             bold: !!line.bold,
