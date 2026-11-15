@@ -217,8 +217,12 @@
     return rows.filter(function (r) { return r.some(function (c) { return String(c).trim() !== ''; }); });
   }
 
-  /* Group pdf.js text items into lines (by y coordinate), top to bottom. */
-  function groupTextItems(items) {
+  function itemWidth(it) {
+    if (typeof it.width === 'number' && it.width > 0) return it.width;
+    var size = Math.abs(it.transform[0]) || 10;
+    return String(it.str || '').length * size * 0.55;
+  }
+  function linesFromItems(items) {
     var sorted = items.slice().sort(function (a, b) {
       var dy = b.transform[5] - a.transform[5];
       if (Math.abs(dy) > 2) return dy;
@@ -238,12 +242,95 @@
       return line.map(function (it) { return it.str; }).join(' ').replace(/\s+/g, ' ').trim();
     }).filter(function (l) { return l !== ''; });
   }
+  /* Find a vertical whitespace gutter (two-column layout) from text items.
+     Returns the gutter center x, or null for single-column pages. */
+  function findTextGutter(items, pageWidth, pageHeight) {
+    var band = items.filter(function (it) {
+      var y = it.transform[5];
+      return y > pageHeight * 0.12 && y < pageHeight * 0.88;
+    });
+    if (band.length < 6) return null;
+    var step = 4, best = null, runStart = null;
+    var xEnd = pageWidth * 0.78;
+    for (var x = pageWidth * 0.22; x <= xEnd; x += step) {
+      var ink = band.some(function (it) {
+        var x0 = it.transform[4], x1 = x0 + itemWidth(it);
+        return x >= x0 - 2 && x <= x1 + 2;
+      });
+      if (!ink) { if (runStart === null) runStart = x; }
+      else if (runStart !== null) {
+        var w = x - runStart;
+        if (!best || w > best.w) best = { x0: runStart, x1: x, w: w };
+        runStart = null;
+      }
+    }
+    if (runStart !== null) {
+      var wEnd = xEnd - runStart;
+      if (!best || wEnd > best.w) best = { x0: runStart, x1: xEnd, w: wEnd };
+    }
+    if (!best || best.w < 20) return null;
+    var cx = (best.x0 + best.x1) / 2;
+    var left = band.filter(function (it) { return it.transform[4] < cx; }).length;
+    var right = band.length - left;
+    if (left < 3 || right < 3) return null;
+    return cx;
+  }
+  /* Group pdf.js text items into lines, top to bottom, column-aware:
+     two-column pages (resumes, brochures) read left column first, then right,
+     with full-width header lines first. */
+  function groupTextItems(items, pageWidth, pageHeight) {
+    if (!items || !items.length) return [];
+    if (!pageWidth || !pageHeight) return linesFromItems(items);
+    var gutter = findTextGutter(items, pageWidth, pageHeight);
+    if (gutter === null) return linesFromItems(items);
+    var top = [], left = [], right = [];
+    items.forEach(function (it) {
+      var y = it.transform[5];
+      if (y > pageHeight * 0.88) top.push(it);
+      else if (it.transform[4] < gutter) left.push(it);
+      else right.push(it);
+    });
+    var out = linesFromItems(top);
+    var leftLines = linesFromItems(left);
+    var rightLines = linesFromItems(right);
+    if (out.length && leftLines.length) out.push('');
+    out = out.concat(leftLines);
+    if (leftLines.length && rightLines.length) out.push('');
+    out = out.concat(rightLines);
+    return out;
+  }
 
   /* ---------------- DOCX builder (JSZip + minimal OOXML, no docx lib) ---------------- */
+  var SECTION_WORDS = /^(summary|professional summary|career objective|objective|contact|contact summary|contact info|contact information|skills|technical skills|key skills|languages?|education|academic|experience|work experience|employment|projects?|certifications?|certificates|references?|personal details|personal information|hobbies|interests|about me|profile)$/i;
+  /* Detect section headings and names/titles so the Word output keeps
+     the document's structure instead of one flat list of paragraphs. */
+  function isHeadingLine(line) {
+    var t = String(line || '').trim();
+    if (!t || t.length > 45) return false;
+    if (SECTION_WORDS.test(t.replace(/[:.]+$/, '').trim())) return true;
+    var letters = (t.match(/[A-Za-z]/g) || []).length;
+    if (letters >= 3 && t === t.toUpperCase() && /[A-Z]/.test(t) && !/\d{4,}/.test(t)) return true;
+    return false;
+  }
+  function toDocxItems(lines) {
+    return lines.map(function (line) {
+      var t = String(line).trim();
+      if (!t) return { text: '' };
+      if (isHeadingLine(t)) return { text: t, heading: true };
+      return { text: t };
+    });
+  }
   function buildDocxXml(paragraphs) {
-    var body = paragraphs.map(function (line) {
-      if (!String(line).trim()) return '<w:p/>';
-      return '<w:p><w:r><w:t xml:space="preserve">' + escapeXml(line) + '</w:t></w:r></w:p>';
+    var body = paragraphs.map(function (p) {
+      var item = typeof p === 'string' ? { text: p } : p;
+      var text = String(item.text == null ? '' : item.text);
+      if (!text.trim()) return '<w:p/>';
+      if (item.heading) {
+        return '<w:p><w:pPr><w:spacing w:before="240" w:after="80"/><w:keepNext/></w:pPr>' +
+          '<w:r><w:rPr><w:b/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>' +
+          '<w:t xml:space="preserve">' + escapeXml(text) + '</w:t></w:r></w:p>';
+      }
+      return '<w:p><w:r><w:t xml:space="preserve">' + escapeXml(text) + '</w:t></w:r></w:p>';
     }).join('');
     return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
       '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
@@ -304,6 +391,107 @@
       throw new Error('This PDF could not be opened. It may be damaged or protected with a password that this tool cannot remove.');
     }
   }
+  /* Grayscale + contrast stretch: helps Tesseract on photos and faint scans. */
+  function prepCanvas(src) {
+    var out = document.createElement('canvas');
+    out.width = src.width; out.height = src.height;
+    var ctx = out.getContext('2d');
+    ctx.drawImage(src, 0, 0);
+    try {
+      var img = ctx.getImageData(0, 0, out.width, out.height);
+      var d = img.data;
+      var lo = 40, hi = 210;
+      for (var i = 0; i < d.length; i += 4) {
+        var lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        var v = (lum - lo) * 255 / (hi - lo);
+        v = v < 0 ? 0 : (v > 255 ? 255 : v);
+        d[i] = d[i + 1] = d[i + 2] = v;
+      }
+      ctx.putImageData(img, 0, 0);
+    } catch (e) { /* canvas unreadable — use the original pixels */ }
+    return out;
+  }
+  function downscaleGray(canvas, targetW) {
+    var w = targetW, h = Math.max(1, Math.round(canvas.height * w / canvas.width));
+    var small = document.createElement('canvas');
+    small.width = w; small.height = h;
+    var ctx = small.getContext('2d');
+    ctx.drawImage(canvas, 0, 0, w, h);
+    var d = ctx.getImageData(0, 0, w, h).data;
+    var gray = new Float32Array(w * h);
+    for (var i = 0, p = 0; i < d.length; i += 4, p++) {
+      gray[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    }
+    return { w: w, h: h, gray: gray };
+  }
+  /* Find a vertical whitespace gutter in a rendered page image.
+     Returns the gutter center as a fraction of the width, or null. */
+  function findCanvasGutter(canvas) {
+    var g = downscaleGray(canvas, 400);
+    var y0 = Math.floor(g.h * 0.15), y1 = Math.floor(g.h * 0.85);
+    var bandH = Math.max(1, y1 - y0);
+    var best = null, runStart = null;
+    var xEnd = Math.floor(g.w * 0.78);
+    for (var x = Math.floor(g.w * 0.22); x <= xEnd; x++) {
+      var ink = 0;
+      for (var y = y0; y < y1; y++) { if (g.gray[y * g.w + x] < 170) ink++; }
+      var empty = ink < bandH * 0.01;
+      if (empty) { if (runStart === null) runStart = x; }
+      else if (runStart !== null) {
+        var w = x - runStart;
+        if (!best || w > best.w) best = { x0: runStart, x1: x, w: w };
+        runStart = null;
+      }
+    }
+    if (runStart !== null) {
+      var wEnd = xEnd - runStart;
+      if (!best || wEnd > best.w) best = { x0: runStart, x1: xEnd, w: wEnd };
+    }
+    if (!best || best.w < g.w * 0.035) return null;
+    var leftInk = 0, rightInk = 0;
+    for (var y = y0; y < y1; y++) {
+      for (var x2 = 0; x2 < best.x0; x2++) if (g.gray[y * g.w + x2] < 170) leftInk++;
+      for (var x3 = best.x1; x3 < g.w; x3++) if (g.gray[y * g.w + x3] < 170) rightInk++;
+    }
+    if (leftInk < 300 || rightInk < 300) return null;
+    return (best.x0 + best.x1) / 2 / g.w;
+  }
+  /* Find a horizontal whitespace band in the top of the page (to cut the
+     full-width header strip). Returns the cut as a y fraction, or null. */
+  function findStripCut(canvas, maxFrac) {
+    var g = downscaleGray(canvas, 300);
+    var maxY = Math.floor(g.h * maxFrac);
+    var bestY = null;
+    for (var y = Math.floor(g.h * 0.04); y < maxY; y++) {
+      var ink = 0;
+      for (var x = 0; x < g.w; x++) { if (g.gray[y * g.w + x] < 170) ink++; }
+      if (ink < g.w * 0.01) bestY = y; /* keep the lowest whitespace row */
+    }
+    return bestY === null ? null : bestY / g.h;
+  }
+  function cropCanvas(src, x0, y0, x1, y1) {
+    var c = document.createElement('canvas');
+    c.width = Math.max(1, x1 - x0); c.height = Math.max(1, y1 - y0);
+    c.getContext('2d').drawImage(src, x0, y0, c.width, c.height, 0, 0, c.width, c.height);
+    return c;
+  }
+  async function ocrCanvas(worker, canvas) {
+    var ret = await worker.recognize(prepCanvas(canvas));
+    var text = (ret && ret.data && ret.data.text) || '';
+    return text.split(/\n/).map(function (l) { return l.trim(); }).filter(function (l) { return l !== ''; });
+  }
+  /* Drop OCR noise: icon misreads and separator lines. Keeps real content. */
+  function cleanOcrLines(lines) {
+    return lines.map(function (l) { return String(l).replace(/\s+/g, ' ').trim(); }).filter(function (l) {
+      if (!l) return false;
+      var alnum = (l.match(/[A-Za-z0-9]/g) || []).length;
+      if (alnum === 0) return false;
+      if (alnum <= 1 && l.length <= 6 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return false;
+      if (l.length <= 3 && alnum <= 2 && l.indexOf('+') === -1 && l.indexOf('#') === -1) return false;
+      return true;
+    });
+  }
+
   /* Read the text of every page. Pages with no selectable text (scanned /
      image-only pages) are read automatically with OCR (Tesseract.js),
      so scanned PDFs work too. onPage(pageNum, total, label) reports progress. */
@@ -334,15 +522,37 @@
       var ctx = canvas.getContext('2d');
       ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
       await page.render({ canvasContext: ctx, viewport: viewport }).promise;
-      var ret = await ocrWorker.recognize(canvas);
-      var text = (ret && ret.data && ret.data.text) || '';
-      return text.split(/\n/).map(function (l) { return l.trim(); }).filter(function (l) { return l !== ''; });
+      var gutter = null;
+      try { gutter = findCanvasGutter(canvas); } catch (e) { gutter = null; }
+      var lines;
+      if (gutter !== null) {
+        /* Two-column page: read the full-width header strip first, then
+           each column separately, so columns never mix on one line. */
+        var gx = Math.floor(canvas.width * gutter);
+        var cutFrac = null;
+        try { cutFrac = findStripCut(canvas, 0.18); } catch (e) { cutFrac = null; }
+        var cutY = cutFrac !== null ? Math.floor(canvas.height * cutFrac) : 0;
+        lines = [];
+        if (cutY > canvas.height * 0.03) {
+          lines = lines.concat(await ocrCanvas(ocrWorker, cropCanvas(canvas, 0, 0, canvas.width, cutY)));
+        }
+        var leftLines = await ocrCanvas(ocrWorker, cropCanvas(canvas, 0, cutY, gx, canvas.height));
+        var rightLines = await ocrCanvas(ocrWorker, cropCanvas(canvas, gx, cutY, canvas.width, canvas.height));
+        if (lines.length && leftLines.length) lines.push('');
+        lines = lines.concat(leftLines);
+        if (leftLines.length && rightLines.length) lines.push('');
+        lines = lines.concat(rightLines);
+      } else {
+        lines = await ocrCanvas(ocrWorker, canvas);
+      }
+      return cleanOcrLines(lines);
     }
     try {
       for (var p = 1; p <= pdf.numPages; p++) {
         var page = await pdf.getPage(p);
+        var vp = page.getViewport({ scale: 1 });
         var content = await page.getTextContent();
-        var lines = groupTextItems(content.items);
+        var lines = groupTextItems(content.items, vp.width, vp.height);
         if (!lines.length) {
           try {
             lines = await ocrPage(page, p, pdf.numPages);
@@ -597,7 +807,7 @@
       throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
     }
     prog(0.9, 'Building the Word document...');
-    var blob = await buildDocxBlob(paragraphs);
+    var blob = await buildDocxBlob(toDocxItems(paragraphs));
     return { files: [{ name: baseOf(file.name) + '.docx', blob: blob }] };
   }
 
@@ -779,7 +989,7 @@
     var text = await readText(file);
     if (!text.trim()) throw new Error('The text file is empty.');
     prog(0.5, 'Building the Word document...');
-    var blob = await buildDocxBlob(text.split(/\n/));
+    var blob = await buildDocxBlob(toDocxItems(text.split(/\n/)));
     return { files: [{ name: baseOf(file.name) + '.docx', blob: blob }] };
   }
 
@@ -869,7 +1079,11 @@
       parseCsv: parseCsv,
       groupTextItems: groupTextItems,
       buildDocxXml: buildDocxXml,
-      escapeXml: escapeXml
+      escapeXml: escapeXml,
+      isHeadingLine: isHeadingLine,
+      toDocxItems: toDocxItems,
+      cleanOcrLines: cleanOcrLines,
+      findTextGutter: findTextGutter
     }
   };
   if (typeof module !== 'undefined' && module.exports) {
