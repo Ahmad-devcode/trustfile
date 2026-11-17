@@ -260,7 +260,16 @@
   function cleanFontName(fontName) {
     var name = String(fontName || '').replace(/^[^+]*\+/, ''); /* strip subset prefix */
     name = name.split(/[-,]/)[0].trim();
-    return /^[A-Za-z][A-Za-z0-9 ]*$/.test(name) ? name : '';
+    if (!/^[A-Za-z][A-Za-z0-9 ]*$/.test(name)) return '';
+    /* PDF base-14 font names have no Word equivalent under the same name;
+       map them to the metric-compatible Word fonts. Symbol/dingbat fonts
+       carry no readable text, so they fall back to the default. */
+    var lower = name.toLowerCase().replace(/[\s_]/g, '');
+    if (lower.indexOf('times') === 0) return 'Times New Roman';
+    if (lower.indexOf('helvetica') === 0) return 'Arial';
+    if (lower.indexOf('courier') === 0) return 'Courier New';
+    if (lower.indexOf('symbol') === 0 || lower.indexOf('zapfdingbats') === 0) return '';
+    return name;
   }
   /* ---- Letter-spaced heading repair (Canva-style PDFs) ----
      Canva emits headings glyph-by-glyph (one showText per glyph, with
@@ -340,6 +349,70 @@
       }
     });
   }
+  /* Extract the painted string from a text-showing op's args: a plain
+     string, or a TJ array of strings and {unicode, width} glyphs. */
+  function showTextString(args) {
+    var arr = null;
+    for (var i = 0; i < args.length; i++) {
+      if (typeof args[i] === 'string' || (args[i] && args[i].length !== undefined)) { arr = args[i]; break; }
+    }
+    if (arr == null) return '';
+    if (typeof arr === 'string') return arr;
+    var s = '';
+    for (var g = 0; g < arr.length; g++) {
+      var el = arr[g];
+      if (typeof el === 'string') s += el;
+      else if (el && typeof el === 'object' && typeof el.unicode === 'string') s += el.unicode;
+    }
+    return s;
+  }
+  /* Recover text colour: pdf.js getTextContent drops colour, but the
+     operator list still sets the fill colour before each showText op.
+     Walk the ops tracking the current fill (with the q/Q stack), record
+     each painted string with its colour, then match them to the text
+     items in order — merging consecutive shows when one item spans
+     several, as pdf.js merges same-state fragments. Items that cannot
+     be matched keep the default colour: a missing colour is always
+     safer than a wrong one. */
+  async function colorizeTextItems(page, items) {
+    var opList = await page.getOperatorList();
+    var OPS = global.pdfjsLib.OPS;
+    var fill = { r: 0, g: 0, b: 0 };
+    var stack = [];
+    var shows = [];
+    for (var i = 0; i < opList.fnArray.length; i++) {
+      var fn = opList.fnArray[i], args = opList.argsArray[i] || [];
+      if (fn === OPS.save) stack.push(fill);
+      else if (fn === OPS.restore) { var s = stack.pop(); if (s) fill = s; }
+      else if (fn === OPS.setFillRGBColor) fill = rgbFromColorArgs('rgb', args);
+      else if (fn === OPS.setFillGray) fill = rgbFromColorArgs('gray', args);
+      else if (fn === OPS.setFillCMYKColor) fill = rgbFromColorArgs('cmyk', args);
+      else if (fn === OPS.showText || fn === OPS.showSpacedText || fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
+        var key = despaceKey(showTextString(args));
+        if (key) shows.push({ key: key, color: rgbHex(fill) });
+      }
+    }
+    var si = 0;
+    items.forEach(function (it) {
+      var key = despaceKey(it.str);
+      if (!key) return;
+      var acc = '', j = si, firstColor = null, mixed = false;
+      while (j < shows.length && acc.length < key.length) {
+        var sh = shows[j++];
+        if (!firstColor) firstColor = sh.color;
+        else if (sh.color !== firstColor) mixed = true;
+        acc += sh.key;
+      }
+      if (acc === key) {
+        si = j;
+        if (!mixed && firstColor && firstColor !== '000000') it._color = firstColor;
+        return;
+      }
+      for (var k = si; k < shows.length; k++) {
+        if (shows[k].key === key) { si = k + 1; if (shows[k].color !== '000000') it._color = shows[k].color; return; }
+      }
+    });
+  }
   function boxesFromTextItems(items, pageHeight, styles) {
     var ph = pageHeight;
     if (!ph) {
@@ -366,6 +439,7 @@
         bold: /bold/i.test(fontLabel),
         italic: /italic|oblique/i.test(fontLabel),
         font: cleanFontName(styleInfo.fontFamily || it.fontName),
+        color: it._color || null, /* fill colour recovered from the operator list, if any */
         spacing: it._spacing || 0 /* letter-spacing recovered from the glyph stream, if any */
       };
     }).filter(function (b) { return b.text.trim() !== ''; }));
@@ -649,27 +723,67 @@
     var lines = mergeRowFragments(groupLines(boxes));
     var styled = lines.map(function (line) {
       var words = line.boxes.slice().sort(function (a, b) { return a.x0 - b.x0; });
-      var text = words.map(function (b) { return b.text; }).join(' ').replace(/\s+/g, ' ').trim();
+      /* Build the line text exactly as before (words joined with single
+         spaces, whitespace collapsed, trimmed) while tracking which box
+         each character came from, so the line can split into per-word
+         runs wherever size/bold/italic/font/colour changes. A mixed
+         line keeps every word's own formatting instead of collapsing
+         to one style (which used to bleed bold across the whole line). */
+      var chars = [];
+      words.forEach(function (b, bi) {
+        var t = String(b.text || '').replace(/\s+/g, ' ');
+        for (var k = 0; k < t.length; k++) chars.push({ ch: t[k], box: bi });
+        if (bi < words.length - 1) chars.push({ ch: ' ', box: bi });
+      });
+      var collapsed = [];
+      chars.forEach(function (c) {
+        if (c.ch === ' ' && collapsed.length && collapsed[collapsed.length - 1].ch === ' ') return;
+        collapsed.push(c);
+      });
+      while (collapsed.length && collapsed[0].ch === ' ') collapsed.shift();
+      while (collapsed.length && collapsed[collapsed.length - 1].ch === ' ') collapsed.pop();
+      var text = collapsed.map(function (c) { return c.ch; }).join('');
+      var runs = [];
+      collapsed.forEach(function (c) {
+        var b = words[c.box];
+        var styleKey = [b.size || 0, b.bold ? 1 : 0, b.italic ? 1 : 0, b.font || '', b.color || ''].join('|');
+        var last = runs[runs.length - 1];
+        if (last && last.key === styleKey) { last.text += c.ch; }
+        else runs.push({ key: styleKey, text: c.ch, size: b.size || 0, bold: !!b.bold, italic: !!b.italic, font: b.font || '', color: b.color || null });
+      });
+      runs.forEach(function (r) { delete r.key; });
       var size = 0, bold = false, italic = false;
       var fonts = {};
+      var colors = {};
       words.forEach(function (b) {
         size = Math.max(size, b.size || 0);
         if (b.bold) bold = true;
         if (b.italic) italic = true;
         if (b.font) fonts[b.font] = (fonts[b.font] || 0) + 1;
+        if (b.color) colors[b.color] = (colors[b.color] || 0) + String(b.text || '').length;
       });
       var font = '';
       Object.keys(fonts).forEach(function (f) { if (!font || fonts[f] > fonts[font]) font = f; });
+      var color = null;
+      Object.keys(colors).forEach(function (c) { if (!color || colors[c] > colors[color]) color = c; });
       /* Letter-spacing recovered from the glyph stream belongs to one
          box (a heading); only carry it when the line is that one box,
          so a repaired heading never spreads its neighbours. */
       var spacing = words.length === 1 ? (words[0].spacing || 0) : 0;
-      return { text: text, x: line.x0, y: line.y0, w: Math.max(10, line.x1 - line.x0), size: size || 11, bold: bold, italic: italic, font: font, spacing: spacing };
+      return { text: text, x: line.x0, y: line.y0, w: Math.max(10, line.x1 - line.x0), size: size || 11, bold: bold, italic: italic, font: font, color: color, runs: runs, spacing: spacing };
     }).filter(function (l) { return l.text !== '' && (!isOcr || (!isNoiseLine(l.text) && !isFragmentLine(l.text))); });
-    /* Headings read bold even when the font name does not say so. */
+    /* Headings read bold even when the font name does not say so. The
+       line-level flag stays for single-style consumers; runs get the
+       same treatment individually so a big word bolds without bolding
+       its smaller neighbours. */
     var sizes = styled.map(function (l) { return l.size; }).sort(function (a, b) { return a - b; });
     var median = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 11;
-    styled.forEach(function (l) { if (l.size >= median * 1.25) l.bold = true; });
+    styled.forEach(function (l) {
+      if (l.size >= median * 1.25) {
+        l.bold = true;
+        l.runs.forEach(function (r) { if (r.size >= median * 1.25) r.bold = true; });
+      }
+    });
     return styled;
   }
 
@@ -737,13 +851,29 @@
     '<dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">Converted by TrustFile</dc:title>' +
     '<dc:creator xmlns:dc="http://purl.org/dc/elements/1.1/">TrustFile</dc:creator>' +
     '</cp:coreProperties>';
-  async function buildDocxZip(documentXml) {
+  async function buildDocxZip(documentXml, media) {
     needLib('jszip');
     var zip = new global.JSZip();
-    zip.file('[Content_Types].xml', DOCX_CONTENT_TYPES);
+    var contentTypes = DOCX_CONTENT_TYPES;
+    var wordRels = DOCX_WORD_RELS;
+    if (media && media.length) {
+      var exts = {};
+      media.forEach(function (m) { exts[m.ext] = m.contentType; });
+      var defaults = Object.keys(exts).map(function (e) { return '<Default Extension="' + e + '" ContentType="' + exts[e] + '"/>'; }).join('');
+      contentTypes = contentTypes.replace('</Types>', defaults + '</Types>');
+      var relsXml = media.map(function (m) {
+        return '<Relationship Id="' + m.relId + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="' + m.partName + '"/>';
+      }).join('');
+      wordRels = wordRels.replace('</Relationships>', relsXml + '</Relationships>');
+      media.forEach(function (m) { zip.file('word/' + m.partName, m.base64, { base64: true }); });
+    }
+    zip.file('[Content_Types].xml', contentTypes);
     zip.file('_rels/.rels', DOCX_RELS);
     zip.file('word/document.xml', documentXml);
-    zip.file('word/_rels/document.rels', DOCX_WORD_RELS);
+    /* The relationships part for word/document.xml lives at
+       word/_rels/document.xml.rels (OOXML standard) — image references
+       only resolve from this exact path. */
+    zip.file('word/_rels/document.xml.rels', wordRels);
     zip.file('word/styles.xml', DOCX_STYLES);
     zip.file('docProps/core.xml', DOCX_CORE);
     return zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
@@ -871,11 +1001,96 @@
     return merged;
   }
 
-  function buildLayoutDocxXml(pages) {
+  /* One line's runs as Word runs: each run keeps its own size (scaled by
+     the line's shrink-to-fit factor), bold/italic, font and colour. */
+  function lineRunsXml(line, fit, spacingTwips) {
+    var scale = line.size > 0 ? fit.size / line.size : 1;
+    var runs = line.runs && line.runs.length ? line.runs : [{ text: line.text, size: line.size, bold: line.bold, italic: line.italic, font: line.font, color: line.color || null }];
+    return runs.map(function (run) {
+      var rPr = '';
+      var f = run.font || line.font;
+      if (f) rPr += '<w:rFonts w:ascii="' + escapeXml(f) + '" w:hAnsi="' + escapeXml(f) + '"/>';
+      if (run.bold) rPr += '<w:b/>';
+      if (run.italic) rPr += '<w:i/>';
+      if (run.color && /^[0-9A-Fa-f]{6}$/.test(run.color)) rPr += '<w:color w:val="' + run.color.toUpperCase() + '"/>';
+      if (spacingTwips > 0) rPr += '<w:spacing w:val="' + spacingTwips + '"/>';
+      var sz = Math.max(8, Math.round((run.size || line.size) * scale * 2));
+      rPr += '<w:sz w:val="' + sz + '"/><w:szCs w:val="' + sz + '"/>';
+      return '<w:r><w:rPr>' + rPr + '</w:rPr><w:t xml:space="preserve">' + escapeXml(run.text) + '</w:t></w:r>';
+    }).join('');
+  }
+  /* Background graphics as DrawingML floating shapes with behindDoc:
+     VML rectangles always paint ABOVE VML text boxes in LibreOffice no
+     matter the document order, which hid every heading sitting on a
+     colour band. DrawingML anchors with behindDoc="1" paint behind the
+     text in both Word and LibreOffice (verified empirically). */
+  function dmlAnchorOpen(id, x, y, w, h, z) {
+    function emu(pt) { return Math.round(pt * 12700); }
+    return '<w:p><w:r><w:drawing><wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="' + (z || 0) + '" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">' +
+      '<wp:simplePos x="0" y="0"/>' +
+      '<wp:positionH relativeFrom="page"><wp:posOffset>' + emu(x) + '</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="page"><wp:posOffset>' + emu(y) + '</wp:posOffset></wp:positionV>' +
+      '<wp:extent cx="' + emu(w) + '" cy="' + emu(h) + '"/>' +
+      '<wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>' +
+      '<wp:docPr id="' + id + '" name="TrustFile Graphic ' + id + '"/><wp:cNvGraphicFramePr/>';
+  }
+  function dmlAnchorClose() {
+    return '</wp:anchor></w:drawing></w:r></w:p>';
+  }
+  function dmlRectXml(id, x, y, w, h, fillHex, strokeHex, strokeWpt, z) {
+    var fill = fillHex ? '<a:solidFill><a:srgbClr val="' + fillHex + '"/></a:solidFill>' : '<a:noFill/>';
+    var ln = strokeHex
+      ? '<a:ln w="' + Math.round(Math.max(0.5, strokeWpt || 1) * 12700) + '"><a:solidFill><a:srgbClr val="' + strokeHex + '"/></a:solidFill></a:ln>'
+      : '<a:ln><a:noFill/></a:ln>';
+    return dmlAnchorOpen(id, x, y, w, h, z) +
+      '<a:graphic><a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">' +
+      '<wps:wsp><wps:cNvSpPr/><wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="' + Math.round(w * 12700) + '" cy="' + Math.round(h * 12700) + '"/></a:xfrm>' +
+      '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>' + fill + ln +
+      '</wps:spPr></wps:wsp></a:graphicData></a:graphic>' + dmlAnchorClose();
+  }
+  function dmlPictureXml(id, x, y, w, h, relId, z) {
+    return dmlAnchorOpen(id, x, y, w, h, z) +
+      '<a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:pic><pic:nvPicPr><pic:cNvPr id="' + id + '" name="TrustFile Image ' + id + '"/><pic:cNvPicPr/></pic:nvPicPr>' +
+      '<pic:blipFill><a:blip r:embed="' + relId + '"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>' +
+      '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="' + Math.round(w * 12700) + '" cy="' + Math.round(h * 12700) + '"/></a:xfrm>' +
+      '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:ln><a:noFill/></a:ln></pic:spPr>' +
+      '</pic:pic></a:graphicData></a:graphic>' + dmlAnchorClose();
+  }
+  function buildLayoutDocxXml(pages, graphics) {
     var shapeId = 0;
     var parts = [];
     parts.push('<w:p><w:r><w:pict><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype></w:pict></w:r></w:p>');
     pages.forEach(function (pg, pi) {
+      /* Background graphics first — photos, colour blocks and rules sit
+         BEHIND the text boxes, at their original PDF positions. Skipped
+         on OCR pages: the scan itself is the background there, and
+         painting it again would double the text. */
+      var g = graphics && graphics[pi];
+      if (g && !pg.isOcr) {
+        /* Emit in the PDF's paint order (seq), with rising relativeHeight
+           so overlapping graphics stack exactly as the PDF painted them:
+           a photo painted after a white panel stays visible above it. */
+        var ordered = [];
+        (g.rects || []).forEach(function (r) { ordered.push({ kind: 'rect', seq: r.seq || 0, item: r }); });
+        (g.lines || []).forEach(function (ln) { ordered.push({ kind: 'line', seq: ln.seq || 0, item: ln }); });
+        (g.images || []).forEach(function (im) { ordered.push({ kind: 'image', seq: im.seq || 0, item: im }); });
+        ordered.sort(function (a, b) { return a.seq - b.seq; });
+        ordered.forEach(function (entry, zi) {
+          shapeId++;
+          if (entry.kind === 'rect') {
+            var r = entry.item;
+            parts.push(dmlRectXml(shapeId, r.x, r.y, r.w, r.h,
+              r.fill ? rgbHex(r.fill) : null, r.stroke ? rgbHex(r.stroke) : null, r.lineWidth, zi + 1));
+          } else if (entry.kind === 'line') {
+            var ln = entry.item;
+            parts.push(dmlRectXml(shapeId, ln.x, ln.y, ln.w, ln.h, rgbHex(ln.color), null, 0, zi + 1));
+          } else if (entry.item._relId) {
+            var im = entry.item;
+            parts.push(dmlPictureXml(shapeId, im.x, im.y, im.w, im.h, im._relId, zi + 1));
+          }
+        });
+      }
       var fitted = fitLineBoxes(pg.lines, pg.width);
       pg.lines.forEach(function (line, li) {
         shapeId++;
@@ -887,18 +1102,12 @@
         var y = Math.max(0, line.y).toFixed(1);
         var w = fitted[li].w.toFixed(1);
         var h = fitted[li].h.toFixed(1);
-        var rPr = '';
-        if (line.font) rPr += '<w:rFonts w:ascii="' + escapeXml(line.font) + '" w:hAnsi="' + escapeXml(line.font) + '"/>';
-        if (line.bold) rPr += '<w:b/>';
-        if (line.italic) rPr += '<w:i/>';
-        if (spacingTwips > 0) rPr += '<w:spacing w:val="' + spacingTwips + '"/>';
-        rPr += '<w:sz w:val="' + Math.round(fitted[li].size * 2) + '"/><w:szCs w:val="' + Math.round(fitted[li].size * 2) + '"/>';
         parts.push(
           '<w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="40" w:lineRule="exact"/></w:pPr>' +
           '<w:r><w:pict>' +
           '<v:shape id="tf' + shapeId + '" type="#_x0000_t202" style="position:absolute;left:' + x + 'pt;top:' + y + 'pt;width:' + w + 'pt;height:' + h + 'pt;mso-position-horizontal-relative:page;mso-position-vertical-relative:page" filled="f" stroked="f">' +
           '<v:textbox inset="0,0,0,0"><w:txbxContent><w:p><w:pPr><w:spacing w:after="0" w:before="0" w:line="240" w:lineRule="auto"/></w:pPr>' +
-          '<w:r><w:rPr>' + rPr + '</w:rPr><w:t xml:space="preserve">' + escapeXml(line.text) + '</w:t></w:r>' +
+          lineRunsXml(line, fitted[li], spacingTwips) +
           '</w:p></w:txbxContent></v:textbox></v:shape>' +
           '</w:pict></w:r></w:p>'
         );
@@ -911,11 +1120,30 @@
     var last = pages[pages.length - 1] || { width: 595, height: 842 };
     parts.push('<w:sectPr><w:pgSz w:w="' + Math.round(last.width * 20) + '" w:h="' + Math.round(last.height * 20) + '"/><w:pgMar w:top="0" w:right="0" w:bottom="0" w:left="0" w:header="0" w:footer="0" w:gutter="0"/></w:sectPr>');
     return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">' +
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">' +
       '<w:body>' + parts.join('') + '</w:body></w:document>';
   }
-  async function buildLayoutDocxBlob(pages) {
-    return buildDocxZip(buildLayoutDocxXml(pages));
+  async function buildLayoutDocxBlob(pages, graphics) {
+    /* Collect the page images into media parts (deduped: a repeated logo
+       is stored once), and stamp each graphic with its relationship id
+       for the document XML to reference. */
+    var media = [], mediaByKey = {};
+    if (graphics) {
+      graphics.forEach(function (g, gi) {
+        if (!g || (pages[gi] && pages[gi].isOcr)) return;
+        (g.images || []).forEach(function (im) {
+          if (mediaByKey[im.dataUrl]) { im._relId = mediaByKey[im.dataUrl]; return; }
+          var m = /^data:([^;,]+);base64,(.*)$/.exec(im.dataUrl || '');
+          if (!m) return;
+          var relId = 'rId' + (media.length + 1);
+          var ext = m[1] === 'image/jpeg' ? 'jpg' : 'png';
+          media.push({ relId: relId, partName: 'media/image' + (media.length + 1) + '.' + ext, contentType: m[1], ext: ext, base64: m[2] });
+          mediaByKey[im.dataUrl] = relId;
+          im._relId = relId;
+        });
+      });
+    }
+    return buildDocxZip(buildLayoutDocxXml(pages, graphics), media.length ? media : null);
   }
 
   /* ---------------- PDF loading helpers ---------------- */
@@ -1023,6 +1251,9 @@
         var page = await pdf.getPage(p);
         var vp = page.getViewport({ scale: 1 });
         var content = await page.getTextContent();
+        /* Recover text colours from the operator list before boxing.
+           Failures never block the conversion — colours stay default. */
+        try { await colorizeTextItems(page, content.items); } catch (e) { /* keep the original items */ }
         /* Repair Canva-style letter-spaced headings before boxing: the
            operator list carries the true word boundaries that
            getTextContent loses. Only runs when a spaced item exists,
@@ -1319,8 +1550,21 @@
       if (!layoutPages.some(function (pg) { return pg.lines.length; })) {
         throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
       }
+      /* Photos, colour blocks and rules from the PDF, placed at their
+         original positions behind the text — the Word file keeps its
+         look, not just its words. A failure here never blocks the text
+         conversion. */
+      var graphics = [];
+      try {
+        var gpdf = await loadPdfJs(file);
+        for (var gp = 1; gp <= gpdf.numPages; gp++) {
+          var gpage = await gpdf.getPage(gp);
+          var gvp = gpage.getViewport({ scale: 1 });
+          graphics.push(await extractPageGraphics(gpage, gvp.width, gvp.height));
+        }
+      } catch (gErr) { graphics = []; }
       prog(0.9, 'Building the Word document...');
-      var layoutBlob = await buildLayoutDocxBlob(layoutPages);
+      var layoutBlob = await buildLayoutDocxBlob(layoutPages, graphics);
       return { files: [{ name: baseOf(file.name) + '.docx', blob: layoutBlob }] };
     }
     var result = await pdfPagesText(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
@@ -1400,7 +1644,8 @@
     var fill = { r: 0, g: 0, b: 0 }, stroke = { r: 0, g: 0, b: 0 }, lineWidth = 1;
     var fillAlpha = 1, strokeAlpha = 1;
     var pathRects = [], pathPts = [], pathCurves = false;
-    var images = [], rects = [];
+    var images = [], rects = [], lines = [];
+    var paintSeq = 0; /* paint order: graphics must stack in op-list order */
     function clearPath() { pathRects = []; pathPts = []; pathCurves = false; }
     function axisAligned(m) { return Math.abs(m[1]) < 0.01 && Math.abs(m[2]) < 0.01; }
     function mapPoint(x, y) {
@@ -1429,10 +1674,11 @@
       if (!clipped) return;
       var r = boxToTopOrigin(clipped);
       if (doFill && !doStroke && fill.r === 255 && fill.g === 255 && fill.b === 255 && r.w * r.h >= pageW * pageH * 0.95) return;
-      rects.push({ x: r.x, y: r.y, w: r.w, h: r.h, fill: doFill ? fill : null, stroke: doStroke ? stroke : null, lineWidth: lineWidth });
+      rects.push({ x: r.x, y: r.y, w: r.w, h: r.h, fill: doFill ? fill : null, stroke: doStroke ? stroke : null, lineWidth: lineWidth, seq: paintSeq++ });
     }
     function emitPath(doFill, doStroke) {
       if (!axisAligned(ctm)) { clearPath(); return; }
+      var rectsBefore = rects.length;
       var i;
       for (i = 0; i < pathRects.length; i++) {
         var pr = pathRects[i];
@@ -1455,6 +1701,28 @@
         });
         if (allCorners && onEdges) {
           pushRectDevice({ x0: minX, y0: minY, x1: maxX, y1: maxY }, doFill, doStroke);
+        }
+      }
+      /* Stroked open paths that are not rectangles: table grid lines,
+         underlines and rules. Record their axis-aligned segments so
+         converters can redraw them as thin bars at the same positions.
+         Diagonal segments (charts, slanted decorations) are skipped. */
+      if (doStroke && rects.length === rectsBefore && !pathCurves && pathPts.length >= 2 && pathPts.length <= 128 && strokeAlpha >= 0.95) {
+        var seg = pathPts.map(function (p) { return mapPoint(p[0], p[1]); });
+        for (var sgi = 0; sgi + 1 < seg.length; sgi++) {
+          var ax = seg[sgi][0], ay = seg[sgi][1], bx = seg[sgi + 1][0], by = seg[sgi + 1][1];
+          var horiz = Math.abs(by - ay) < 0.6, vert = Math.abs(bx - ax) < 0.6;
+          if (!horiz && !vert) continue;
+          var len = horiz ? Math.abs(bx - ax) : Math.abs(by - ay);
+          if (len < 2) continue;
+          var lw = Math.max(1, lineWidth);
+          var b = horiz
+            ? { x0: Math.min(ax, bx), y0: ay - lw / 2, x1: Math.max(ax, bx), y1: ay + lw / 2 }
+            : { x0: ax - lw / 2, y0: Math.min(ay, by), x1: ax + lw / 2, y1: Math.max(ay, by) };
+          var clipped = intersectBox(b);
+          if (!clipped) continue;
+          var r = boxToTopOrigin(clipped);
+          lines.push({ x: r.x, y: r.y, w: r.w, h: r.h, color: stroke, lineWidth: lineWidth, seq: paintSeq++ });
         }
       }
       clearPath();
@@ -1507,7 +1775,7 @@
              heavily clipped images are masks and decorations. */
           if (vis && (vis.x1 - vis.x0) * (vis.y1 - vis.y0) >= 0.5 * (ib.x1 - ib.x0) * (ib.y1 - ib.y0)) {
             var ir = boxToTopOrigin(ib);
-            if (ir.w >= 2 && ir.h >= 2) images.push({ x: ir.x, y: ir.y, w: ir.w, h: ir.h, objId: args[0] });
+            if (ir.w >= 2 && ir.h >= 2) images.push({ x: ir.x, y: ir.y, w: ir.w, h: ir.h, objId: args[0], seq: paintSeq++ });
           }
         }
       }
@@ -1519,7 +1787,13 @@
       if (seen[k]) return false;
       seen[k] = true; return true;
     });
-    return { images: images, rects: rects };
+    var seenLines = {};
+    lines = lines.filter(function (l) {
+      var k = [Math.round(l.x), Math.round(l.y), Math.round(l.w), Math.round(l.h), l.color.r + ',' + l.color.g + ',' + l.color.b].join('|');
+      if (seenLines[k]) return false;
+      seenLines[k] = true; return true;
+    }).slice(0, 1000);
+    return { images: images, rects: rects, lines: lines };
   }
   function getPdfObj(page, objId, timeoutMs) {
     return new Promise(function (resolve) {
@@ -1566,9 +1840,9 @@
       var im = found.images[i];
       var data = await getPdfObj(page, im.objId, 5000);
       var dataUrl = data ? imageDataToDataUrl(data) : null;
-      if (dataUrl) images.push({ x: im.x, y: im.y, w: im.w, h: im.h, dataUrl: dataUrl });
+      if (dataUrl) images.push({ x: im.x, y: im.y, w: im.w, h: im.h, dataUrl: dataUrl, seq: im.seq });
     }
-    return { images: images, rects: found.rects };
+    return { images: images, rects: found.rects, lines: found.lines };
   }
   async function toolPdfToPptx(files, opts, prog) {
     needLib('pptxgenjs');
@@ -1632,15 +1906,31 @@
         var s = pptx.addSlide();
         var g = graphics[idx];
         if (g) {
-          g.rects.forEach(function (r) {
-            var shapeOpts = { x: r.x / 72, y: r.y / 72, w: r.w / 72, h: r.h / 72 };
-            if (r.fill) shapeOpts.fill = { color: rgbHex(r.fill) };
-            if (r.stroke) shapeOpts.line = { color: rgbHex(r.stroke), width: Math.max(0.5, r.lineWidth) };
-            else shapeOpts.line = { type: 'none' };
-            try { s.addShape(pptx.ShapeType.rect, shapeOpts); } catch (e) { /* skip */ }
-          });
-          g.images.forEach(function (im) {
-            try { s.addImage({ data: im.dataUrl, x: im.x / 72, y: im.y / 72, w: im.w / 72, h: im.h / 72 }); } catch (e) { /* skip */ }
+          /* Paint order (seq): overlapping graphics stack as the PDF
+             painted them — a photo painted after a white panel stays
+             visible above it. */
+          var ordered = [];
+          g.rects.forEach(function (r) { ordered.push({ kind: 'rect', seq: r.seq || 0, item: r }); });
+          (g.lines || []).forEach(function (ln) { ordered.push({ kind: 'line', seq: ln.seq || 0, item: ln }); });
+          g.images.forEach(function (im) { ordered.push({ kind: 'image', seq: im.seq || 0, item: im }); });
+          ordered.sort(function (a, b) { return a.seq - b.seq; });
+          ordered.forEach(function (entry) {
+            try {
+              if (entry.kind === 'rect') {
+                var r = entry.item;
+                var shapeOpts = { x: r.x / 72, y: r.y / 72, w: r.w / 72, h: r.h / 72 };
+                if (r.fill) shapeOpts.fill = { color: rgbHex(r.fill) };
+                if (r.stroke) shapeOpts.line = { color: rgbHex(r.stroke), width: Math.max(0.5, r.lineWidth) };
+                else shapeOpts.line = { type: 'none' };
+                s.addShape(pptx.ShapeType.rect, shapeOpts);
+              } else if (entry.kind === 'line') {
+                var ln = entry.item;
+                s.addShape(pptx.ShapeType.rect, { x: ln.x / 72, y: ln.y / 72, w: ln.w / 72, h: ln.h / 72, fill: { color: rgbHex(ln.color) }, line: { type: 'none' } });
+              } else {
+                var im = entry.item;
+                s.addImage({ data: im.dataUrl, x: im.x / 72, y: im.y / 72, w: im.w / 72, h: im.h / 72 });
+              }
+            } catch (e) { /* skip */ }
           });
         }
         var fitted = fitLineBoxes(pg.lines, pg.width);
@@ -1654,7 +1944,7 @@
             fontSize: Math.max(6, fitted[li].size),
             bold: !!line.bold,
             italic: !!line.italic,
-            color: '000000',
+            color: line.color || '000000',
             valign: 'top',
             wrap: fitted[li].wraps > 1,
             margin: 0
@@ -1713,8 +2003,315 @@
      to a PDF, cutting pages BETWEEN block elements so no line of text is
      ever split across a page boundary. Each slice keeps the document's
      own margins, so the PDF looks like the document, not a reflow. */
-  async function htmlContainerToPdf(container, prog) {
+  /* ---------- DOCX structure: floating drawings + page size ----------
+     docx-preview drops wps:wsp picture shapes entirely (the shape-with-
+     picture-fill Word uses for logos) and renders floating pic:pic
+     anchors at the wrong position — inline at the paragraph start,
+     ignoring positionH/positionV and text wrap. We parse document.xml
+     ourselves so Word->PDF can inject the dropped images and reposition
+     the misplaced ones. The same pass reads the page size, so Letter,
+     legal and landscape documents keep their size instead of being
+     forced onto A4. The zip is read locally with JSZip; nothing is
+     uploaded. */
+  function docxNum(v, def) {
+    var n = parseFloat(v);
+    return isFinite(n) ? n : (def || 0);
+  }
+  function docxXmlText(el) {
+    return el ? String(el.textContent || '').trim() : '';
+  }
+  function parseAnchorPos(posEl) {
+    if (!posEl) return null;
+    var off = elChild(posEl, 'posOffset');
+    var al = elChild(posEl, 'align');
+    return {
+      relativeFrom: posEl.getAttribute('relativeFrom') || 'page',
+      offset: off ? docxNum(docxXmlText(off)) / 9525 : null,
+      align: al ? docxXmlText(al) : null
+    };
+  }
+  function parseDrawingGeom(spPr) {
+    var geom = { prst: 'rect', radiusPct: 0, border: null };
+    if (!spPr) return geom;
+    var prstGeom = elChild(spPr, 'prstGeom');
+    if (prstGeom) {
+      geom.prst = prstGeom.getAttribute('prst') || 'rect';
+      if (geom.prst === 'roundRect') {
+        geom.radiusPct = 0.16667;
+        var avLst = elChild(prstGeom, 'avLst');
+        var gd = avLst && elChild(avLst, 'gd');
+        if (gd && gd.getAttribute('name') === 'adj') {
+          var fmla = String(gd.getAttribute('fmla') || '');
+          var vm = /val\s+(\d+)/.exec(fmla);
+          var f = vm ? parseInt(vm[1], 10) : docxNum(fmla, NaN);
+          if (isFinite(f)) geom.radiusPct = Math.max(0, Math.min(0.5, f / 100000));
+        }
+      }
+    }
+    var ln = elChild(spPr, 'ln');
+    if (ln && !elChild(ln, 'noFill')) {
+      var c = solidFillColor(ln);
+      if (c) {
+        geom.border = {
+          color: '#' + ('0' + c.r.toString(16)).slice(-2) + ('0' + c.g.toString(16)).slice(-2) + ('0' + c.b.toString(16)).slice(-2),
+          width: Math.max(0.5, docxNum(ln.getAttribute('w'), 9525) / 9525)
+        };
+      }
+    }
+    return geom;
+  }
+  function parseSrcRect(blipFill) {
+    var srcRect = blipFill && elChild(blipFill, 'srcRect');
+    if (!srcRect) return null;
+    var c = {
+      l: docxNum(srcRect.getAttribute('l')) / 100000, t: docxNum(srcRect.getAttribute('t')) / 100000,
+      r: docxNum(srcRect.getAttribute('r')) / 100000, b: docxNum(srcRect.getAttribute('b')) / 100000
+    };
+    if (!(c.l || c.t || c.r || c.b)) return null;
+    return c;
+  }
+  function parseDocxDrawing(drawing, rels) {
+    if (elChild(drawing, 'inline')) return { kind: 'inline' };
+    var anchor = elChild(drawing, 'anchor');
+    if (!anchor) return null;
+    var out = {
+      kind: 'anchor',
+      behindDoc: anchor.getAttribute('behindDoc') === '1',
+      simplePos: anchor.getAttribute('simplePos') === '1',
+      distL: docxNum(anchor.getAttribute('distL')) / 9525,
+      distR: docxNum(anchor.getAttribute('distR')) / 9525,
+      distT: docxNum(anchor.getAttribute('distT')) / 9525,
+      distB: docxNum(anchor.getAttribute('distB')) / 9525,
+      posH: parseAnchorPos(elChild(anchor, 'positionH')),
+      posV: parseAnchorPos(elChild(anchor, 'positionV')),
+      wrap: 'wrapNone', crop: null, geom: null, rid: null, target: null, shape: null
+    };
+    var sp = elChild(anchor, 'simplePos');
+    if (sp) { out.simpleX = docxNum(sp.getAttribute('x')) / 9525; out.simpleY = docxNum(sp.getAttribute('y')) / 9525; }
+    var ext = elChild(anchor, 'extent');
+    out.w = ext ? docxNum(ext.getAttribute('cx')) / 9525 : 0;
+    out.h = ext ? docxNum(ext.getAttribute('cy')) / 9525 : 0;
+    ['wrapNone', 'wrapSquare', 'wrapTight', 'wrapThrough', 'wrapTopAndBottom'].forEach(function (w) {
+      if (elChild(anchor, w)) out.wrap = w;
+    });
+    var picEl = elDescendants(anchor, 'pic')[0];
+    var wspEl = elDescendants(anchor, 'wsp')[0];
+    if (picEl) {
+      out.shape = 'pic';
+      var picSpPr = elChild(picEl, 'spPr');
+      /* In pic:pic the blipFill is a direct child of pic, not in spPr. */
+      var blipFill = elChild(picEl, 'blipFill');
+      var blip = blipFill && elChild(blipFill, 'blip');
+      out.rid = blip ? relAttr(blip, 'embed') : null;
+      out.crop = parseSrcRect(blipFill);
+      out.geom = parseDrawingGeom(picSpPr);
+    } else if (wspEl) {
+      out.shape = 'wsp';
+      var wspSpPr = elChild(wspEl, 'spPr');
+      var wBlipFill = wspSpPr && elChild(wspSpPr, 'blipFill');
+      var wBlip = wBlipFill && elChild(wBlipFill, 'blip');
+      out.rid = wBlip ? relAttr(wBlip, 'embed') : null;
+      out.crop = parseSrcRect(wBlipFill);
+      out.geom = parseDrawingGeom(wspSpPr);
+    } else {
+      return null;
+    }
+    if (!out.rid || !rels[out.rid]) return null;
+    out.target = rels[out.rid];
+    if (!out.w || !out.h) return null;
+    return out;
+  }
+  function parseDocxStructure(docXmlText, relsXmlText) {
+    var result = { drawings: [], bodyCount: 0, page: { wPt: 595.28, hPt: 841.89 } };
+    var doc = xmlDoc(docXmlText);
+    var rels = relsXmlText ? parseRels(relsXmlText) : {};
+    var body = doc.documentElement && elChild(doc.documentElement, 'body');
+    if (!body) return result;
+    var sectPrs = elDescendants(body, 'sectPr');
+    if (sectPrs.length) {
+      var pgSz = elChild(sectPrs[0], 'pgSz');
+      if (pgSz) {
+        /* Attributes are namespace-prefixed (w:w / w:h) in Word files. */
+        var w = docxNum(pgSz.getAttribute('w:w') || pgSz.getAttribute('w'));
+        var h = docxNum(pgSz.getAttribute('w:h') || pgSz.getAttribute('h'));
+        if (w > 0 && h > 0) { result.page.wPt = w / 20; result.page.hPt = h / 20; }
+      }
+    }
+    var bodyKids = [];
+    for (var i = 0; i < body.childNodes.length; i++) {
+      var n = body.childNodes[i];
+      if (n.nodeType === 1) {
+        var ln = localNameOf(n);
+        if (ln === 'p' || ln === 'tbl') bodyKids.push(n);
+      }
+    }
+    result.bodyCount = bodyKids.length;
+    elDescendants(body, 'drawing').forEach(function (drawing) {
+      /* Skip VML fallbacks: mc:Fallback duplicates the DrawingML drawing. */
+      var anc = drawing.parentNode, inFallback = false, topKid = null, inTbl = false;
+      while (anc && anc !== body) {
+        if (localNameOf(anc) === 'Fallback') inFallback = true;
+        if (localNameOf(anc) === 'tbl') inTbl = true;
+        if (anc.parentNode === body) topKid = anc;
+        anc = anc.parentNode;
+      }
+      if (inFallback) return;
+      var d = parseDocxDrawing(drawing, rels);
+      if (!d) return;
+      d.bodyIndex = topKid ? bodyKids.indexOf(topKid) : -1;
+      d.inTable = inTbl;
+      result.drawings.push(d);
+    });
+    return result;
+  }
+  function resolveAnchorCoord(pos, origins, sizes, extent) {
+    if (!pos) return null;
+    var frame = pos.relativeFrom || 'page';
+    var origin = origins[frame] != null ? origins[frame] : origins.page;
+    var size = sizes[frame] != null ? sizes[frame] : sizes.page;
+    if (pos.align) {
+      var a = pos.align;
+      if (a === 'left' || a === 'top' || a === 'inside') return origin;
+      if (a === 'center' || a === 'middle') return origin + (size - extent) / 2;
+      if (a === 'right' || a === 'bottom' || a === 'outside') return origin + size - extent;
+      return origin;
+    }
+    if (pos.offset != null) return origin + pos.offset;
+    return origin;
+  }
+  function applyDrawingGeom(el, d) {
+    var g = d.geom;
+    if (!g) return;
+    if (g.prst === 'roundRect' && g.radiusPct > 0) {
+      el.style.borderRadius = (g.radiusPct * Math.min(d.w, d.h)).toFixed(1) + 'px';
+    } else if (g.prst === 'ellipse') {
+      el.style.borderRadius = '50%';
+    }
+    if (g.border) {
+      el.style.border = g.border.width.toFixed(1) + 'px solid ' + g.border.color;
+      el.style.boxSizing = 'border-box';
+    }
+  }
+  /* Wrap an image in a clipping box when the picture has a crop rectangle
+     (a:srcRect): the box shows the kept region at the drawing's size. */
+  function cropBoxFor(img, d) {
+    if (!d.crop) return img;
+    var c = d.crop;
+    var kw = Math.max(0.05, 1 - c.l - c.r), kh = Math.max(0.05, 1 - c.t - c.b);
+    var box = document.createElement('div');
+    box.style.cssText = 'overflow:hidden;width:' + d.w + 'px;height:' + d.h + 'px;';
+    img.style.cssText = 'width:' + (d.w / kw).toFixed(1) + 'px;height:' + (d.h / kh).toFixed(1) + 'px;' +
+      'margin-left:' + (-c.l * d.w / kw).toFixed(1) + 'px;margin-top:' + (-c.t * d.h / kh).toFixed(1) + 'px;max-width:none;';
+    box.appendChild(img);
+    return box;
+  }
+  function placeDrawingImg(container, img, d, anchorEl, anchorSection, cRect) {
+    var sec = anchorSection || container;
+    var sRect = sec.getBoundingClientRect();
+    var cs = global.getComputedStyle(sec);
+    var padL = parseFloat(cs.paddingLeft) || 0, padT = parseFloat(cs.paddingTop) || 0;
+    var padR = parseFloat(cs.paddingRight) || 0, padB = parseFloat(cs.paddingBottom) || 0;
+    var contentX = sRect.left - cRect.left + padL;
+    var contentY = sRect.top - cRect.top + padT;
+    var contentW = Math.max(1, sRect.width - padL - padR);
+    var contentH = Math.max(1, sRect.height - padT - padB);
+    var pRect = anchorEl.getBoundingClientRect();
+    var pX = pRect.left - cRect.left, pY = pRect.top - cRect.top;
+    var x = resolveAnchorCoord(d.posH,
+      { page: sRect.left - cRect.left, margin: contentX, column: contentX, paragraph: pX, character: pX },
+      { page: sRect.width, margin: contentW, column: contentW, paragraph: pRect.width, character: pRect.width }, d.w);
+    var y = resolveAnchorCoord(d.posV,
+      { page: sRect.top - cRect.top, margin: contentY, column: contentY, paragraph: pY, line: pY },
+      { page: sRect.height, margin: contentH, column: contentH, paragraph: pRect.height, line: pRect.height }, d.h);
+    if (d.simplePos) {
+      x = (sRect.left - cRect.left) + (d.simpleX || 0);
+      y = (sRect.top - cRect.top) + (d.simpleY || 0);
+    }
+    if (x == null || !isFinite(x)) x = contentX;
+    if (y == null || !isFinite(y)) y = pY;
+    var box = cropBoxFor(img, d);
+    var floatWrap = d.wrap === 'wrapSquare' || d.wrap === 'wrapTight' || d.wrap === 'wrapThrough';
+    if (floatWrap && !d.behindDoc) {
+      /* Float so the paragraph text wraps around the picture, as in Word. */
+      var side = (x + d.w / 2) > (contentX + contentW / 2) ? 'right' : 'left';
+      var mTop = 0;
+      if (d.posV && (d.posV.relativeFrom === 'paragraph' || d.posV.relativeFrom === 'line') && d.posV.offset != null) mTop = Math.max(0, d.posV.offset);
+      box.style.cssText = 'float:' + side + ';width:' + d.w.toFixed(1) + 'px;height:' + d.h.toFixed(1) + 'px;' +
+        'margin:' + mTop.toFixed(1) + 'px ' + d.distR.toFixed(1) + 'px ' + d.distB.toFixed(1) + 'px ' + d.distL.toFixed(1) + 'px;';
+      applyDrawingGeom(box, d);
+      if (box.parentNode !== anchorEl) anchorEl.insertBefore(box, anchorEl.firstChild);
+      return;
+    }
+    box.style.cssText = 'position:absolute;left:' + x.toFixed(1) + 'px;top:' + y.toFixed(1) + 'px;' +
+      'width:' + d.w.toFixed(1) + 'px;height:' + d.h.toFixed(1) + 'px;margin:0;padding:0;z-index:5;';
+    applyDrawingGeom(box, d);
+    container.appendChild(box);
+  }
+  async function placeFloatingDrawings(container, zip, structure) {
+    var drawings = structure.drawings;
+    if (!drawings.length) return { placed: 0, skipped: 0 };
+    var sections = Array.prototype.slice.call(container.querySelectorAll('section.docx'));
+    var blocks = [], blockSections = [];
+    sections.forEach(function (sec) {
+      Array.prototype.forEach.call(sec.children, function (ch) {
+        if (ch.tagName === 'ARTICLE') {
+          Array.prototype.forEach.call(ch.children, function (el) { blocks.push(el); blockSections.push(sec); });
+        }
+      });
+    });
+    if (!blocks.length) {
+      Array.prototype.forEach.call(container.children, function (el) { blocks.push(el); blockSections.push(container); });
+    }
+    /* docx-preview renders inline pictures and floating pic anchors, in
+       document order. Only reposition floating pictures when the counts
+       line up exactly — otherwise a header/footer image would shift the
+       mapping and the wrong picture would move. */
+    var renderedImgs = Array.prototype.slice.call(container.querySelectorAll('img'));
+    var expected = 0;
+    drawings.forEach(function (d) { if (d.kind === 'inline' || d.shape === 'pic') expected++; });
+    var canReposition = renderedImgs.length === expected;
+    var imgCursor = 0, placed = 0, skipped = 0;
+    var cRect = container.getBoundingClientRect();
+    for (var i = 0; i < drawings.length; i++) {
+      var d = drawings[i];
+      if (d.kind === 'inline') { imgCursor++; continue; }
+      if (d.inTable || d.bodyIndex < 0 || d.bodyIndex >= blocks.length) {
+        if (d.shape === 'pic') imgCursor++;
+        skipped++;
+        continue;
+      }
+      var img = null;
+      if (d.shape === 'pic' && canReposition) {
+        img = renderedImgs[imgCursor] || null;
+        imgCursor++;
+      } else if (d.shape === 'pic') {
+        imgCursor++;
+        skipped++;
+        continue; /* leave docx-preview's rendering untouched */
+      }
+      if (!img) {
+        var path = resolveTarget('word', d.target);
+        var file = zip.file(path);
+        if (!file) { skipped++; continue; }
+        var ext = (path.split('.').pop() || '').toLowerCase();
+        var mime = { png: 'image/png', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp', jpg: 'image/jpeg', jpeg: 'image/jpeg' }[ext];
+        if (!mime) { skipped++; continue; } /* EMF/WMF/TIFF cannot render in a browser */
+        var b64 = await file.async('base64');
+        img = document.createElement('img');
+        img.src = 'data:' + mime + ';base64,' + b64;
+        img.alt = '';
+      }
+      try {
+        placeDrawingImg(container, img, d, blocks[d.bodyIndex], blockSections[d.bodyIndex], cRect);
+        placed++;
+      } catch (e) { skipped++; }
+    }
+    return { placed: placed, skipped: skipped };
+  }
+
+  async function htmlContainerToPdf(container, prog, opts) {
     needLib('html2canvas'); needLib('jspdf');
+    opts = opts || {};
     var imgs = container.querySelectorAll('img');
     await Promise.all(Array.prototype.map.call(imgs, function (img) {
       if (img.complete) return Promise.resolve();
@@ -1726,33 +2323,65 @@
       });
     }));
     var canvas = await global.html2canvas(container, { scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false });
-    var pageW = 595.28, pageH = 841.89;
+    var pageW = opts.pageW || 595.28, pageH = opts.pageH || 841.89;
     var pxPerPt = canvas.width / pageW;
     var sliceHpx = Math.floor(pageH * pxPerPt);
-    /* Cut points: bottom edges of top-level blocks, in canvas pixels. */
+    /* Cut points: bottom edges of rendered blocks, in canvas pixels.
+       Scope to each rendered section's article children (docx-preview
+       output) so content splits between blocks, add table-row bottoms so
+       a long table splits between rows instead of mid-row, and treat
+       every section boundary as a mandatory cut (Word sections and
+       explicit page breaks start a new page). */
     var cRect = container.getBoundingClientRect();
+    var renderScale = cRect.width > 0 ? canvas.width / cRect.width : 2;
     var blocks = [];
-    var sections = container.querySelectorAll('.docx-section');
-    var scopes = sections.length ? sections : [container];
-    Array.prototype.forEach.call(scopes, function (scope) {
-      Array.prototype.forEach.call(scope.children, function (el) {
-        var r = el.getBoundingClientRect();
-        if (r.height > 0) blocks.push((r.bottom - cRect.top) * 2);
+    var mandatory = [];
+    var sections = container.querySelectorAll('section.docx');
+    if (sections.length) {
+      Array.prototype.forEach.call(sections, function (sec) {
+        var articles = sec.querySelectorAll('article');
+        var scopeEls = articles.length ? articles : [sec];
+        Array.prototype.forEach.call(scopeEls, function (scope) {
+          Array.prototype.forEach.call(scope.children, function (el) {
+            var r = el.getBoundingClientRect();
+            if (r.height > 0) blocks.push((r.bottom - cRect.top) * renderScale);
+          });
+        });
+        Array.prototype.forEach.call(sec.querySelectorAll('tr'), function (tr) {
+          var r = tr.getBoundingClientRect();
+          if (r.height > 0) blocks.push((r.bottom - cRect.top) * renderScale);
+        });
+        var sr = sec.getBoundingClientRect();
+        if (sr.height > 0) mandatory.push((sr.bottom - cRect.top) * renderScale);
       });
-    });
+    } else {
+      Array.prototype.forEach.call(container.children, function (el) {
+        var r = el.getBoundingClientRect();
+        if (r.height > 0) blocks.push((r.bottom - cRect.top) * renderScale);
+      });
+    }
     blocks.sort(function (a, b) { return a - b; });
+    mandatory.sort(function (a, b) { return a - b; });
     var cuts = [0];
     var bandEnd = sliceHpx;
     while (bandEnd < canvas.height) {
+      var lastCut = cuts[cuts.length - 1];
       var cut = bandEnd;
-      for (var i = blocks.length - 1; i >= 0; i--) {
-        if (blocks[i] > cuts[cuts.length - 1] + 40 && blocks[i] <= bandEnd) { cut = Math.floor(blocks[i]); break; }
+      /* Never slice across a section boundary: if one falls inside this
+         band, cut there even if the page is not full yet. */
+      for (var mi = 0; mi < mandatory.length; mi++) {
+        if (mandatory[mi] > lastCut + 40 && mandatory[mi] <= bandEnd) { cut = Math.floor(mandatory[mi]); break; }
+      }
+      if (cut === bandEnd) {
+        for (var i = blocks.length - 1; i >= 0; i--) {
+          if (blocks[i] > lastCut + 40 && blocks[i] <= bandEnd) { cut = Math.floor(blocks[i]); break; }
+        }
       }
       cuts.push(cut);
       bandEnd = cut + sliceHpx;
     }
     cuts.push(canvas.height);
-    var doc = new global.jspdf.jsPDF({ unit: 'pt', format: 'a4', orientation: 'portrait', compress: true });
+    var doc = new global.jspdf.jsPDF({ unit: 'pt', format: [pageW, pageH], orientation: pageW > pageH ? 'landscape' : 'portrait', compress: true });
     for (var p = 0; p < cuts.length - 1; p++) {
       var top = cuts[p], h = cuts[p + 1] - top;
       if (h <= 0) continue;
@@ -1839,14 +2468,31 @@
     var buf = await readArrayBuffer(file);
     var usedFallback = false;
     var blob = null;
+    var floatingNote = null;
     try {
       /* docx-preview needs JSZip loaded first: its bundle takes
          window.JSZip as a factory argument when it loads. */
       await loadLib('jszip');
       await loadLib('docxpreview');
       needLib('docxpreview'); needLib('html2canvas'); needLib('jspdf');
+      /* Parse the document structure first: page size + floating
+         drawings. Best-effort — a parse failure must never break the
+         conversion; the plain render below still stands. */
+      var structure = null, zip = null;
+      try {
+        zip = new global.JSZip();
+        await zip.loadAsync(buf.slice(0));
+        var docXmlFile = zip.file('word/document.xml');
+        var relsFile = zip.file('word/_rels/document.xml.rels');
+        if (docXmlFile) {
+          structure = parseDocxStructure(await docXmlFile.async('text'), relsFile ? await relsFile.async('text') : null);
+        }
+      } catch (e) { structure = null; }
+      var pageW = structure ? structure.page.wPt : 595.28;
+      var pageH = structure ? structure.page.hPt : 841.89;
+      var containerW = Math.round(pageW * 96 / 72);
       var container = document.createElement('div');
-      container.style.cssText = 'position:absolute;left:-10000px;top:0;width:794px;background:#ffffff;';
+      container.style.cssText = 'position:absolute;left:-10000px;top:0;width:' + containerW + 'px;background:#ffffff;';
       document.body.appendChild(container);
       try {
         await global.docx.renderAsync(buf.slice(0), container);
@@ -1860,9 +2506,24 @@
           '.docx-wrapper section.docx{box-shadow:none!important;margin:0 auto!important;}' +
           'p[class*="docx-num-"]:before{content:none!important;}';
         container.appendChild(flat);
+        /* docx-preview copies the TABLE's page alignment (tblPr jc) onto
+           every row as text-align, which wrongly centres all cell text.
+           In Word, cell text alignment comes from the paragraph, which
+           docx-preview already renders inline on each <p>. */
+        container.querySelectorAll('tr').forEach(function (tr) {
+          if (tr.style && tr.style.textAlign) tr.style.textAlign = '';
+        });
         fixDocxListMarkers(container);
+        if (structure && zip) {
+          try {
+            var placed = await placeFloatingDrawings(container, zip, structure);
+            if (placed.skipped > 0 && placed.placed === 0) {
+              floatingNote = 'Some floating pictures in this document could not be placed exactly as in Word.';
+            }
+          } catch (e) { /* floating images are best-effort; the text render stands */ }
+        }
         prog(0.4, 'Laying out the pages...');
-        blob = await htmlContainerToPdf(container, prog);
+        blob = await htmlContainerToPdf(container, prog, { pageW: pageW, pageH: pageH });
       } finally {
         container.remove();
       }
@@ -1900,6 +2561,7 @@
     prog(1, 'Done');
     var result = { files: [{ name: baseOf(file.name) + '.pdf', blob: blob }] };
     if (usedFallback) result.note = 'Rendered in compatibility mode (the high-fidelity renderer could not be used for this file), so some formatting may differ from Word. Images and tables are kept.';
+    else if (floatingNote) result.note = floatingNote;
     return result;
   }
 
@@ -2165,23 +2827,140 @@
     });
     return parts.join('/');
   }
-  function solidFillColor(parentEl) {
+  /* Office theme colours: the scheme lives in ppt/theme/theme1.xml and
+     differs per file (a deck's accent1 may be orange, not Office blue).
+     Without the theme we fall back to the Office 2007 palette. */
+  var PPT_THEME_FALLBACK = { dk1: '000000', lt1: 'FFFFFF', dk2: '1F497D', lt2: 'EEECE1', accent1: '4F81BD', accent2: 'C0504D', accent3: '9BBB59', accent4: '8064A2', accent5: '4BACC6', accent6: 'F79646', hlink: '0563C1', folHlink: '954F72', bg1: 'FFFFFF', tx1: '000000', bg2: 'EEECE1', tx2: '1F497D' };
+  function hexToRgb(hex) {
+    if (!/^[0-9a-fA-F]{6}$/.test(hex || '')) return null;
+    return { r: parseInt(hex.substr(0, 2), 16), g: parseInt(hex.substr(2, 2), 16), b: parseInt(hex.substr(4, 2), 16) };
+  }
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    var max = Math.max(r, g, b), min = Math.min(r, g, b), h = 0, s = 0, l = (max + min) / 2;
+    if (max !== min) {
+      var d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+      else if (max === g) h = (b - r) / d + 2;
+      else h = (r - g) / d + 4;
+      h /= 6;
+    }
+    return { h: h, s: s, l: l };
+  }
+  function hslToRgb(h, s, l) {
+    var r, g, b;
+    if (s === 0) { r = g = b = l; } else {
+      var q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+      var p = 2 * l - q;
+      var f = function (t) {
+        if (t < 0) t += 1; if (t > 1) t -= 1;
+        if (t < 1 / 6) return p + (q - p) * 6 * t;
+        if (t < 1 / 2) return q;
+        if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+        return p;
+      };
+      r = f(h + 1 / 3); g = f(h); b = f(h - 1 / 3);
+    }
+    return { r: Math.round(r * 255), g: Math.round(g * 255), b: Math.round(b * 255) };
+  }
+  /* DrawingML colour transforms (children of srgbClr/schemeClr/sysClr):
+     tint lightens toward white, shade darkens toward black, lumMod scales
+     luminance, lumOff shifts it. Applied in document order. */
+  function applyClrTransforms(rgb, clrEl) {
+    if (!rgb || !clrEl) return rgb;
+    var hsl = null;
+    function ensureHsl() { if (!hsl) hsl = rgbToHsl(rgb.r, rgb.g, rgb.b); }
+    var kids = clrEl.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (k.nodeType !== 1) continue;
+      var v = parseFloat(k.getAttribute('val') || '0') / 100000;
+      var ln = localNameOf(k);
+      if (ln === 'tint') { ensureHsl(); hsl.l = hsl.l + (1 - hsl.l) * v; }
+      else if (ln === 'shade') { ensureHsl(); hsl.l = hsl.l * (1 - v); }
+      else if (ln === 'lumMod') { ensureHsl(); hsl.l = hsl.l * v; }
+      else if (ln === 'lumOff') { ensureHsl(); hsl.l = hsl.l + v; }
+    }
+    if (!hsl) return rgb;
+    hsl.l = Math.max(0, Math.min(1, hsl.l));
+    return hslToRgb(hsl.h, hsl.s, hsl.l);
+  }
+  function parseThemeColors(themeDoc) {
+    var map = {};
+    if (!themeDoc) return map;
+    var scheme = elDescendants(themeDoc.documentElement, 'clrScheme')[0];
+    if (!scheme) return map;
+    var kids = scheme.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (k.nodeType !== 1) continue;
+      var name = localNameOf(k);
+      var srgb = elChild(k, 'srgbClr');
+      var sys = elChild(k, 'sysClr');
+      var rgb = srgb ? hexToRgb(srgb.getAttribute('val')) : (sys ? hexToRgb(sys.getAttribute('lastClr')) : null);
+      if (rgb) map[name] = rgb;
+    }
+    return map;
+  }
+  function parseThemeLnWidths(themeDoc) {
+    /* fmtScheme/lnStyleLst defines the widths for lnRef idx 1/2/3.
+       Without it, use the Office defaults (0.75 / 1.5 / 2.25 pt). */
+    var widths = [0.75, 1.5, 2.25];
+    if (!themeDoc) return widths;
+    var fmt = elDescendants(themeDoc.documentElement, 'fmtScheme')[0];
+    var lst = fmt && elChild(fmt, 'lnStyleLst');
+    if (!lst) return widths;
+    var lns = elChildren(lst, 'ln');
+    lns.forEach(function (ln, i) {
+      var w = ln.getAttribute('w');
+      if (w) widths[i] = Math.max(0.25, parseFloat(w) / EMU_PER_PT);
+    });
+    return widths;
+  }
+  /* Colour carried by a style reference (lnRef/fillRef): the ref's child
+     colour element overrides the theme style's own colour. */
+  function styleRefColor(refEl, theme) {
+    if (!refEl) return null;
+    var clr = elChild(refEl, 'srgbClr');
+    if (clr) return applyClrTransforms(hexToRgb(clr.getAttribute('val')), clr);
+    var scheme = elChild(refEl, 'schemeClr');
+    if (scheme) return applyClrTransforms(themeColor(theme, scheme.getAttribute('val')), scheme);
+    var sys = elChild(refEl, 'sysClr');
+    if (sys) return applyClrTransforms(hexToRgb(sys.getAttribute('lastClr')), sys);
+    return null;
+  }
+  function themeColor(theme, name) {
+    if (theme && theme[name]) return theme[name];
+    var hex = PPT_THEME_FALLBACK[name];
+    return hex ? hexToRgb(hex) : null;
+  }
+  function solidFillColor(parentEl, theme) {
     var fill = parentEl && elChild(parentEl, 'solidFill');
     if (!fill) return null;
     var clr = elChild(fill, 'srgbClr');
-    if (clr) {
-      var v = String(clr.getAttribute('val') || '');
-      if (/^[0-9a-fA-F]{6}$/.test(v)) {
-        return { r: parseInt(v.substr(0, 2), 16), g: parseInt(v.substr(2, 2), 16), b: parseInt(v.substr(4, 2), 16) };
-      }
-      return null;
-    }
+    if (clr) return applyClrTransforms(hexToRgb(clr.getAttribute('val')), clr);
     var scheme = elChild(fill, 'schemeClr');
-    if (scheme) {
-      var map = { dk1: '000000', lt1: 'FFFFFF', dk2: '1F497D', lt2: 'EEECE1', accent1: '4F81BD', accent2: 'C0504D', accent3: '9BBB59', accent4: '8064A2', accent5: '4BACC6', accent6: 'F79646', hlink: '0563C1', folHlink: '954F72', bg1: 'FFFFFF', tx1: '000000', bg2: 'EEECE1', tx2: '1F497D' };
-      var hex = map[scheme.getAttribute('val')];
-      if (hex) return { r: parseInt(hex.substr(0, 2), 16), g: parseInt(hex.substr(2, 2), 16), b: parseInt(hex.substr(4, 2), 16) };
-    }
+    if (scheme) return applyClrTransforms(themeColor(theme, scheme.getAttribute('val')), scheme);
+    var sys = elChild(fill, 'sysClr');
+    if (sys) return applyClrTransforms(hexToRgb(sys.getAttribute('lastClr')), sys);
+    return null;
+  }
+  /* Gradient fills cannot be reproduced by the vector renderer; the first
+     gradient stop is a much closer approximation than no fill at all
+     (a white-on-gradient label stays readable). */
+  function gradientFirstColor(parentEl, theme) {
+    var grad = parentEl && elChild(parentEl, 'gradFill');
+    if (!grad) return null;
+    var gsLst = elChild(grad, 'gsLst');
+    var gs = gsLst && elChild(gsLst, 'gs');
+    if (!gs) return null;
+    var clr = elChild(gs, 'srgbClr');
+    if (clr) return applyClrTransforms(hexToRgb(clr.getAttribute('val')), clr);
+    var scheme = elChild(gs, 'schemeClr');
+    if (scheme) return applyClrTransforms(themeColor(theme, scheme.getAttribute('val')), scheme);
+    var sys = elChild(gs, 'sysClr');
+    if (sys) return applyClrTransforms(hexToRgb(sys.getAttribute('lastClr')), sys);
     return null;
   }
   function shapeBox(spPr, tf) {
@@ -2195,21 +2974,101 @@
     var h = parseFloat(ext.getAttribute('cy')) / EMU_PER_PT;
     return { x: tf.dx + x * tf.sx, y: tf.dy + y * tf.sy, w: w * tf.sx, h: h * tf.sy };
   }
-  function runStyle(rPr, text) {
-    var style = { text: text, size: 18, bold: false, italic: false, color: null, font: '' };
+  function runStyle(rPr, text, theme) {
+    var style = { text: text, size: 18, bold: false, italic: false, underline: false, color: null, font: '' };
     if (rPr) {
       if (rPr.getAttribute('sz')) style.size = Math.max(4, parseInt(rPr.getAttribute('sz'), 10) / 100);
       if (rPr.getAttribute('b') === '1') style.bold = true;
       if (rPr.getAttribute('i') === '1') style.italic = true;
-      style.color = solidFillColor(rPr);
+      var u = rPr.getAttribute('u');
+      if (u && u !== 'none') style.underline = true;
+      style.color = solidFillColor(rPr, theme);
       var latin = elChild(rPr, 'latin');
       if (latin && latin.getAttribute('typeface')) style.font = latin.getAttribute('typeface');
     }
     return style;
   }
-  function parseSlideParagraph(pEl) {
+  /* One paragraph's properties as inherited through
+     master txStyles -> layout lstStyle -> slide pPr, most specific wins.
+     Undefined fields mean "keep inheriting". */
+  function parseParaProps(pPrEl, theme) {
+    var p = {};
+    if (!pPrEl) return p;
+    var algn = pPrEl.getAttribute('algn');
+    if (algn) p.align = algn === 'ctr' ? 'center' : (algn === 'r' ? 'right' : (algn === 'just' ? 'left' : 'left'));
+    var marL = pPrEl.getAttribute('marL');
+    if (marL !== null && marL !== '') p.marL = parseFloat(marL) / EMU_PER_PT;
+    var indent = pPrEl.getAttribute('indent');
+    if (indent !== null && indent !== '') p.indent = parseFloat(indent) / EMU_PER_PT;
+    var lnSpc = elChild(pPrEl, 'lnSpc');
+    if (lnSpc) {
+      var pct = elChild(lnSpc, 'spcPct');
+      var pts = elChild(lnSpc, 'spcPts');
+      if (pct) p.lnSpc = { pct: parseFloat(pct.getAttribute('val') || '100000') / 100000 };
+      else if (pts) p.lnSpc = { pts: parseFloat(pts.getAttribute('val') || '0') / 100 };
+    }
+    [['spcBef', 'spcBef'], ['spcAft', 'spcAft']].forEach(function (pair) {
+      var sp = elChild(pPrEl, pair[0]);
+      if (!sp) return;
+      var pct = elChild(sp, 'spcPct');
+      var pts = elChild(sp, 'spcPts');
+      if (pct) p[pair[1]] = { pct: parseFloat(pct.getAttribute('val') || '0') / 100000 };
+      else if (pts) p[pair[1]] = { pts: parseFloat(pts.getAttribute('val') || '0') / 100 };
+    });
+    if (elChild(pPrEl, 'buNone')) p.bullet = { type: 'none' };
+    else {
+      var buChar = elChild(pPrEl, 'buChar');
+      if (buChar) p.bullet = { type: 'char', char: buChar.getAttribute('char') || '•' };
+      else {
+        var buAuto = elChild(pPrEl, 'buAutoNum');
+        if (buAuto) p.bullet = { type: 'autoNum', numType: buAuto.getAttribute('type') || 'arabicPeriod', startAt: parseInt(buAuto.getAttribute('startAt') || '1', 10) || 1 };
+        else if (elChild(pPrEl, 'buBlip')) p.bullet = { type: 'char', char: '•' };
+      }
+    }
+    var defRPr = elChild(pPrEl, 'defRPr');
+    if (defRPr) {
+      /* Only record attributes actually present: an absent attribute
+         must keep inheriting instead of resetting to a default. */
+      if (defRPr.getAttribute('sz')) p.defSize = Math.max(4, parseInt(defRPr.getAttribute('sz'), 10) / 100);
+      if (defRPr.getAttribute('b') !== null) p.defBold = defRPr.getAttribute('b') === '1';
+      if (defRPr.getAttribute('i') !== null) p.defItalic = defRPr.getAttribute('i') === '1';
+      if (defRPr.getAttribute('u') !== null) p.defUnderline = defRPr.getAttribute('u') !== 'none';
+      var dc = solidFillColor(defRPr, theme);
+      if (dc) p.defColor = dc;
+      var latin = elChild(defRPr, 'latin');
+      if (latin && latin.getAttribute('typeface')) p.defFont = latin.getAttribute('typeface');
+    }
+    return p;
+  }
+  function mergeParaProps(base, over) {
+    var out = {};
+    var keys = ['align', 'marL', 'indent', 'lnSpc', 'spcBef', 'spcAft', 'bullet', 'defSize', 'defBold', 'defItalic', 'defUnderline', 'defColor', 'defFont'];
+    keys.forEach(function (k) {
+      if (over && over[k] !== undefined) out[k] = over[k];
+      else if (base && base[k] !== undefined) out[k] = base[k];
+    });
+    return out;
+  }
+  /* lstStyle / txStyle: defPPr + lvl1pPr..lvl9pPr -> array of 9 level
+     property objects (each level inherits from the level above it, and
+     level 0 inherits from defPPr). */
+  function parseLevelStyles(styleEl, theme) {
+    var levels = [];
+    var base = parseParaProps(styleEl && elChild(styleEl, 'defPPr'), theme);
+    var prev = base;
+    for (var lvl = 1; lvl <= 9; lvl++) {
+      var lvlEl = styleEl && elChild(styleEl, 'lvl' + lvl + 'pPr');
+      var cur = mergeParaProps(prev, parseParaProps(lvlEl, theme));
+      levels.push(cur);
+      prev = cur;
+    }
+    return levels;
+  }
+  function parseSlideParagraph(pEl, theme, levelProps) {
     var pPr = elChild(pEl, 'pPr');
-    var algn = pPr && pPr.getAttribute('algn');
+    var lvl = 0;
+    if (pPr && pPr.getAttribute('lvl')) lvl = Math.max(0, Math.min(8, parseInt(pPr.getAttribute('lvl'), 10) || 0));
+    var props = mergeParaProps(levelProps && levelProps[lvl], parseParaProps(pPr, theme));
     var defRPr = pPr && elChild(pPr, 'defRPr');
     var runs = [];
     var kids = pEl.childNodes || [];
@@ -2220,55 +3079,174 @@
       if (ln === 'r' || ln === 'fld') {
         var tEl = elChild(k, 't');
         var text = tEl ? (tEl.textContent || '') : '';
-        if (text) runs.push(runStyle(elChild(k, 'rPr') || defRPr, text));
+        if (!text) continue;
+        var rPr = elChild(k, 'rPr') || defRPr;
+        var r = runStyle(rPr, text, theme);
+        /* Fill in anything the run itself did not specify from the
+           paragraph's inherited defaults. */
+        if (!rPr || !rPr.getAttribute('sz')) { if (props.defSize !== undefined) r.size = props.defSize; }
+        if (!rPr || rPr.getAttribute('b') === null) { if (props.defBold !== undefined) r.bold = props.defBold; }
+        if (!rPr || rPr.getAttribute('i') === null) { if (props.defItalic !== undefined) r.italic = props.defItalic; }
+        if (!rPr || rPr.getAttribute('u') === null) { if (props.defUnderline !== undefined) r.underline = props.defUnderline; }
+        if (!r.color && props.defColor) r.color = props.defColor;
+        if (!r.font && props.defFont) r.font = props.defFont;
+        runs.push(r);
       } else if (ln === 'br') {
         runs.push({ br: true });
       }
     }
-    return { align: algn === 'ctr' ? 'center' : (algn === 'r' ? 'right' : 'left'), runs: runs };
+    return {
+      align: props.align || 'left', runs: runs, level: lvl,
+      marL: props.marL || 0, indent: props.indent || 0,
+      bullet: props.bullet || null, lnSpc: props.lnSpc || null,
+      spcBef: props.spcBef || null, spcAft: props.spcAft || null
+    };
   }
-  function parseTextShape(el, tf) {
+  /* Placeholder shapes (<p:ph>) usually carry no position of their own:
+     position, size and text styles come from the matching placeholder on
+     the slide layout, with the slide master's txStyles as the fallback. */
+  function phInfoOf(el) {
+    var nvSpPr = elChild(el, 'nvSpPr');
+    var nvPr = nvSpPr && elChild(nvSpPr, 'nvPr');
+    var ph = nvPr && elChild(nvPr, 'ph');
+    if (!ph) return null;
+    return { type: ph.getAttribute('type') || 'body', idx: parseInt(ph.getAttribute('idx') || '0', 10) || 0 };
+  }
+  function txStyleKey(phType) {
+    if (phType === 'title' || phType === 'ctrTitle') return 'title';
+    if (phType === 'body' || phType === 'obj' || phType === 'subTitle') return 'body';
+    return 'other';
+  }
+  /* Placeholder matching is by idx first (the OOXML identity of a
+     placeholder), then by type. */
+  function matchPhShape(shapes, type, idx) {
+    var exact = null, byIdx = null, byType = null;
+    (shapes || []).forEach(function (el) {
+      var info = phInfoOf(el);
+      if (!info) return;
+      if (info.idx === idx && info.type === type && !exact) exact = el;
+      else if (info.idx === idx && !byIdx) byIdx = el;
+      else if (info.type === type && !byType) byType = el;
+    });
+    return exact || byIdx || byType;
+  }
+  function shapeLevelProps(el, txBody, ctx) {
+    if (!ctx) return null;
+    var ph = phInfoOf(el);
+    var levels = null;
+    if (ph && ctx.txStyles) {
+      levels = ctx.txStyles[txStyleKey(ph.type)] || null;
+      /* Master placeholder lstStyle sits between txStyles and the
+         layout placeholder lstStyle in the inheritance chain. */
+      var masterEl = ctx.findMasterPh && ctx.findMasterPh(ph.type, ph.idx);
+      if (masterEl) {
+        var masterTx = elChild(masterEl, 'txBody');
+        var masterLst = masterTx && elChild(masterTx, 'lstStyle');
+        if (masterLst) {
+          var masterLevels = parseLevelStyles(masterLst, ctx.theme);
+          levels = (levels || []).map(function (lv, i) { return mergeParaProps(lv, masterLevels[i]); });
+          if (!levels.length) levels = masterLevels;
+        }
+      }
+      var layoutEl = ctx.findLayoutPh && ctx.findLayoutPh(ph.type, ph.idx);
+      if (layoutEl) {
+        var layoutTx = elChild(layoutEl, 'txBody');
+        var layoutLst = layoutTx && elChild(layoutTx, 'lstStyle');
+        if (layoutLst) {
+          var layoutLevels = parseLevelStyles(layoutLst, ctx.theme);
+          levels = (levels || []).map(function (lv, i) { return mergeParaProps(lv, layoutLevels[i]); });
+          if (!levels.length) levels = layoutLevels;
+        }
+      }
+    }
+    /* The shape's own lstStyle wins over everything inherited. */
+    var ownLst = txBody && elChild(txBody, 'lstStyle');
+    if (ownLst) {
+      var ownLevels = parseLevelStyles(ownLst, ctx.theme);
+      levels = (levels || ownLevels.map(function () { return {}; })).map(function (lv, i) { return mergeParaProps(lv, ownLevels[i]); });
+    }
+    return levels;
+  }
+  function parseTextShape(el, tf, ctx) {
     var spPr = elChild(el, 'spPr');
-    var box = shapeBox(spPr, tf) || { x: 0, y: 0, w: 100, h: 50 };
-    var fill = spPr ? solidFillColor(spPr) : null;
+    var box = shapeBox(spPr, tf);
+    var theme = ctx && ctx.theme;
+    if (!box && ctx) {
+      /* Placeholder without its own geometry: inherit the box from the
+         layout placeholder, then from the slide master placeholder
+         (the default template keeps geometry only on the master). */
+      var ph = phInfoOf(el);
+      if (ph) {
+        var inheritEls = [];
+        if (ctx.findLayoutPh) inheritEls.push(ctx.findLayoutPh(ph.type, ph.idx));
+        if (ctx.findMasterPh) inheritEls.push(ctx.findMasterPh(ph.type, ph.idx));
+        for (var ii = 0; ii < inheritEls.length && !box; ii++) {
+          if (inheritEls[ii]) box = shapeBox(elChild(inheritEls[ii], 'spPr'), tf);
+        }
+      }
+    }
+    if (!box) box = { x: 0, y: 0, w: 100, h: 50 };
+    var fill = spPr ? (solidFillColor(spPr, theme) || gradientFirstColor(spPr, theme)) : null;
     if (spPr && elChild(spPr, 'noFill')) fill = null;
-    var geom = 'rect', line = null;
+    var geom = 'rect', line = null, rot = 0;
+    /* Shape style references (fillRef/lnRef) apply when the shape has no
+       explicit fill/line of its own. */
+    var styleEl = elChild(el, 'style');
+    if (!fill && !(spPr && elChild(spPr, 'noFill')) && styleEl) {
+      var fillRef = elChild(styleEl, 'fillRef');
+      if (fillRef && fillRef.getAttribute('idx') !== '0') fill = styleRefColor(fillRef, theme);
+    }
     if (spPr) {
       var prst = elChild(spPr, 'prstGeom');
       if (prst && prst.getAttribute('prst')) geom = prst.getAttribute('prst');
       var ln = elChild(spPr, 'ln');
       if (ln && !elChild(ln, 'noFill')) {
-        var lc = solidFillColor(ln);
+        var lc = solidFillColor(ln, theme);
         var lw = ln.getAttribute('w') ? parseFloat(ln.getAttribute('w')) / EMU_PER_PT : 1;
         if (lc) line = { color: lc, width: Math.max(0.5, lw) };
+      } else if (!ln && styleEl) {
+        var lnRef = elChild(styleEl, 'lnRef');
+        if (lnRef && lnRef.getAttribute('idx') !== '0') {
+          var rc = styleRefColor(lnRef, theme);
+          if (rc) {
+            var widths = (ctx && ctx.lnWidths) || [0.75, 1.5, 2.25];
+            var widx = Math.max(1, parseInt(lnRef.getAttribute('idx') || '1', 10) || 1) - 1;
+            line = { color: rc, width: Math.max(0.5, widths[widx] || 1) };
+          }
+        }
       }
+      var xfrm = elChild(spPr, 'xfrm');
+      if (xfrm && xfrm.getAttribute('rot')) rot = (parseFloat(xfrm.getAttribute('rot')) || 0) / 60000;
     }
     var txBody = elChild(el, 'txBody');
     var paras = [];
-    var anchor = 't', wrap = true;
+    var anchor = 't', wrap = true, autoFit = false;
     var insets = { l: 91440 / EMU_PER_PT, t: 45720 / EMU_PER_PT, r: 91440 / EMU_PER_PT, b: 45720 / EMU_PER_PT };
+    var levels = shapeLevelProps(el, txBody, ctx);
     if (txBody) {
       var bodyPr = elChild(txBody, 'bodyPr');
       if (bodyPr) {
         if (bodyPr.getAttribute('anchor')) anchor = bodyPr.getAttribute('anchor');
         if (bodyPr.getAttribute('wrap') === 'none') wrap = false;
+        if (elChild(bodyPr, 'spAutoFit')) autoFit = true;
         ['lIns', 'tIns', 'rIns', 'bIns'].forEach(function (a, idx) {
           var v = bodyPr.getAttribute(a);
           if (v !== null && v !== '') insets[['l', 't', 'r', 'b'][idx]] = parseFloat(v) / EMU_PER_PT;
         });
       }
-      elChildren(txBody, 'p').forEach(function (pEl) { paras.push(parseSlideParagraph(pEl)); });
+      elChildren(txBody, 'p').forEach(function (pEl) { paras.push(parseSlideParagraph(pEl, theme, levels)); });
     }
-    return { kind: 'text', box: box, fill: fill, geom: geom, line: line, paras: paras, anchor: anchor, wrap: wrap, insets: insets };
+    return { kind: 'text', box: box, fill: fill, geom: geom, line: line, paras: paras, anchor: anchor, wrap: wrap, insets: insets, rot: rot, autoFit: autoFit };
   }
   /* Tables live in graphicFrames: <a:tbl> with a grid, rows and cells.
      Charts and diagrams share the graphicFrame element, so only frames
      that actually contain a table become table shapes. */
-  function parseTableShape(el, tf) {
+  function parseTableShape(el, tf, ctx) {
     var tbl = elDescendants(el, 'tbl')[0];
     if (!tbl) return { kind: 'unsupported' };
     var box = shapeBox(el, tf);
     if (!box) return { kind: 'unsupported' };
+    var theme = ctx && ctx.theme;
     var grid = [];
     var gridEl = elChild(tbl, 'tblGrid');
     if (gridEl) elChildren(gridEl, 'gridCol').forEach(function (gc) {
@@ -2280,36 +3258,45 @@
     elChildren(tbl, 'tr').forEach(function (tr) {
       var rowH = (parseFloat(tr.getAttribute('h')) || 0) / EMU_PER_PT * tf.sy;
       var cells = [];
+      var gridIdx = 0;
       elChildren(tr, 'tc').forEach(function (tc) {
         var tcPr = elChild(tc, 'tcPr');
-        var span = tcPr && tcPr.getAttribute('gridSpan') ? parseInt(tcPr.getAttribute('gridSpan'), 10) : 1;
-        var cellFill = tcPr ? solidFillColor(tcPr) : null;
-        var text = '', size = 12, bold = false, color = null, align = 'left';
+        /* gridSpan/rowSpan/vMerge are attributes of <a:tc> itself in
+           DrawingML (unlike WordprocessingML, where gridSpan is in tcPr). */
+        var span = tc.getAttribute('gridSpan') ? parseInt(tc.getAttribute('gridSpan'), 10)
+          : (tcPr && tcPr.getAttribute('gridSpan') ? parseInt(tcPr.getAttribute('gridSpan'), 10) : 1);
+        var rowSpan = tc.getAttribute('rowSpan') ? parseInt(tc.getAttribute('rowSpan'), 10) : 1;
+        var vMerge = tc.getAttribute('vMerge') === '1' || (tcPr && tcPr.getAttribute('vMerge') === '1');
+        var hMerge = tc.getAttribute('hMerge') === '1' || (tcPr && tcPr.getAttribute('hMerge') === '1');
+        var cellFill = tcPr ? (solidFillColor(tcPr, theme) || gradientFirstColor(tcPr, theme)) : null;
+        var margins = { l: 91440 / EMU_PER_PT, t: 45720 / EMU_PER_PT, r: 91440 / EMU_PER_PT, b: 45720 / EMU_PER_PT };
+        var anchor = 't';
+        if (tcPr) {
+          if (tcPr.getAttribute('anchor')) anchor = tcPr.getAttribute('anchor');
+          ['marL', 'marT', 'marR', 'marB'].forEach(function (a, idx) {
+            var v = tcPr.getAttribute(a);
+            if (v !== null && v !== '') margins[['l', 't', 'r', 'b'][idx]] = parseFloat(v) / EMU_PER_PT;
+          });
+        }
+        var paras = [];
         var txBody = elChild(tc, 'txBody');
         if (txBody) {
-          var parts = [];
-          elChildren(txBody, 'p').forEach(function (pEl) {
-            var para = parseSlideParagraph(pEl);
-            align = para.align;
-            para.runs.forEach(function (r) {
-              if (r.br) { parts.push('\n'); return; }
-              parts.push(r.text);
-              if (r.size && r.size !== 18) size = r.size;
-              if (r.bold) bold = true;
-              if (r.color) color = r.color;
-            });
-            parts.push('\n');
-          });
-          text = parts.join('').replace(/\n+$/, '');
+          var lst = elChild(txBody, 'lstStyle');
+          var levels = lst ? parseLevelStyles(lst, theme) : null;
+          elChildren(txBody, 'p').forEach(function (pEl) { paras.push(parseSlideParagraph(pEl, theme, levels)); });
         }
-        cells.push({ text: text, size: size, bold: bold, color: color, align: align, fill: cellFill, span: span });
+        cells.push({ paras: paras, fill: cellFill, span: Math.max(1, span), rowSpan: Math.max(1, rowSpan), vMerge: !!vMerge, hMerge: !!hMerge, gridIdx: gridIdx, margins: margins, anchor: anchor });
+        /* Every <a:tc> occupies exactly one grid column in sequence;
+           the spanning cell's width comes from its span, not from
+           skipping grid positions. */
+        gridIdx += 1;
       });
       rows.push({ h: rowH, cells: cells });
     });
     if (!rows.length || !grid.length) return { kind: 'unsupported' };
     return { kind: 'table', box: box, grid: grid, rows: rows, firstRow: !!firstRow };
   }
-  function parseConnectorShape(el, tf) {
+  function parseConnectorShape(el, tf, ctx) {
     var spPr = elChild(el, 'spPr');
     var box = shapeBox(spPr, tf) || { x: 0, y: 0, w: 100, h: 0 };
     var xfrm = spPr && elChild(spPr, 'xfrm');
@@ -2319,7 +3306,7 @@
     if (spPr) {
       var ln = elChild(spPr, 'ln');
       if (ln && !elChild(ln, 'noFill')) {
-        var lc = solidFillColor(ln) || { r: 0, g: 0, b: 0 };
+        var lc = solidFillColor(ln, ctx && ctx.theme) || { r: 0, g: 0, b: 0 };
         var lw = ln.getAttribute('w') ? parseFloat(ln.getAttribute('w')) / EMU_PER_PT : 1;
         line = { color: lc, width: Math.max(0.5, lw) };
       }
@@ -2336,9 +3323,20 @@
       var target = rels[relAttr(blip, 'embed')];
       if (target) mediaPath = resolveTarget(dir, target);
     }
-    return { kind: 'pic', box: box, mediaPath: mediaPath };
+    var crop = null;
+    var srcRect = blipFill && elChild(blipFill, 'srcRect');
+    if (srcRect) {
+      crop = {
+        l: (parseFloat(srcRect.getAttribute('l') || '0') || 0) / 100000,
+        t: (parseFloat(srcRect.getAttribute('t') || '0') || 0) / 100000,
+        r: (parseFloat(srcRect.getAttribute('r') || '0') || 0) / 100000,
+        b: (parseFloat(srcRect.getAttribute('b') || '0') || 0) / 100000
+      };
+      if (!(crop.l || crop.t || crop.r || crop.b)) crop = null;
+    }
+    return { kind: 'pic', box: box, mediaPath: mediaPath, crop: crop };
   }
-  function walkSlideShapes(container, tf, out, rels, dir) {
+  function walkSlideShapes(container, tf, out, rels, dir, ctx) {
     var kids = container.childNodes || [];
     for (var i = 0; i < kids.length; i++) {
       var el = kids[i];
@@ -2357,27 +3355,33 @@
           var cx = parseFloat(chOff.getAttribute('x')) / EMU_PER_PT, cy = parseFloat(chOff.getAttribute('y')) / EMU_PER_PT;
           ntf = { dx: tf.dx + (ox - cx * sx) * tf.sx, dy: tf.dy + (oy - cy * sy) * tf.sy, sx: tf.sx * sx, sy: tf.sy * sy };
         }
-        walkSlideShapes(el, ntf, out, rels, dir);
+        walkSlideShapes(el, ntf, out, rels, dir, ctx);
       } else if (ln === 'sp') {
-        out.push(parseTextShape(el, tf));
+        out.push(parseTextShape(el, tf, ctx));
       } else if (ln === 'pic') {
         out.push(parsePicShape(el, tf, rels, dir));
       } else if (ln === 'cxnSp') {
-        out.push(parseConnectorShape(el, tf));
+        out.push(parseConnectorShape(el, tf, ctx));
       } else if (ln === 'graphicFrame') {
-        out.push(parseTableShape(el, tf));
+        out.push(parseTableShape(el, tf, ctx));
       }
     }
   }
-  function parseSlideDoc(doc, rels, dir) {
+  function parseSlideDoc(doc, rels, dir, ctx) {
     var root = doc.documentElement;
     var cSld = elChild(root, 'cSld');
+    var theme = ctx && ctx.theme;
     var bg = null;
     var bgEl = cSld && elChild(cSld, 'bg');
-    if (bgEl) bg = solidFillColor(elChild(bgEl, 'bgPr'));
+    if (bgEl) {
+      var bgPr = elChild(bgEl, 'bgPr');
+      bg = solidFillColor(bgPr, theme) || gradientFirstColor(bgPr, theme);
+    }
+    /* Background fallback chain: slide -> layout -> master. */
+    if (!bg && ctx) bg = ctx.layoutBg || ctx.masterBg || null;
     var shapes = [];
     var spTree = cSld && elChild(cSld, 'spTree');
-    if (spTree) walkSlideShapes(spTree, { dx: 0, dy: 0, sx: 1, sy: 1 }, shapes, rels, dir);
+    if (spTree) walkSlideShapes(spTree, { dx: 0, dy: 0, sx: 1, sy: 1 }, shapes, rels, dir, ctx);
     return { bg: bg, shapes: shapes };
   }
   async function parsePptx(zip, prog) {
@@ -2402,6 +3406,106 @@
     }
     var slides = [];
     var skipped = 0;
+    /* --- Slide masters, layouts and themes (placeholder inheritance) --- */
+    var themeCache = {};
+    async function loadTheme(path) {
+      if (!path) return { colors: {}, lnWidths: [0.75, 1.5, 2.25] };
+      if (themeCache[path]) return themeCache[path];
+      var rec = { colors: {}, lnWidths: [0.75, 1.5, 2.25] };
+      try {
+        var f = zip.file(path);
+        if (f) {
+          var themeDoc = xmlDoc(await f.async('text'));
+          rec.colors = parseThemeColors(themeDoc);
+          rec.lnWidths = parseThemeLnWidths(themeDoc);
+        }
+      } catch (e) { /* fall back to the built-in palette */ }
+      themeCache[path] = rec;
+      return rec;
+    }
+    async function relsFor(partPath) {
+      var dir = partPath.split('/').slice(0, -1).join('/');
+      var relsPath = dir + '/_rels/' + partPath.split('/').pop() + '.rels';
+      if (!zip.file(relsPath)) return {};
+      try { return parseRels(await zip.file(relsPath).async('text')); } catch (e) { return {}; }
+    }
+    function bgOfDoc(doc, theme) {
+      var cSld = doc.documentElement && elChild(doc.documentElement, 'cSld');
+      var bgEl = cSld && elChild(cSld, 'bg');
+      if (!bgEl) return null;
+      var bgPr = elChild(bgEl, 'bgPr');
+      return solidFillColor(bgPr, theme) || gradientFirstColor(bgPr, theme);
+    }
+    var masters = [];
+    var layoutByPath = {};
+    try {
+      var masterPaths = [];
+      elDescendants(presDoc.documentElement, 'sldMasterId').forEach(function (idEl) {
+        var target = presRels[relAttr(idEl, 'id')];
+        if (target) masterPaths.push(resolveTarget('ppt', target));
+      });
+      for (var mi = 0; mi < masterPaths.length; mi++) {
+        var mPath = masterPaths[mi];
+        var mFile = zip.file(mPath);
+        if (!mFile) continue;
+        var mDoc = xmlDoc(await mFile.async('text'));
+        var mRels = await relsFor(mPath);
+        var mDir = mPath.split('/').slice(0, -1).join('/');
+        var themePath = null;
+        Object.keys(mRels).forEach(function (rid) {
+          var t = mRels[rid];
+          if (/\/theme\/theme\d+\.xml$/.test(t)) themePath = resolveTarget(mDir, t);
+        });
+        if (!themePath && zip.file('ppt/theme/theme1.xml')) themePath = 'ppt/theme/theme1.xml';
+        var themeRec = await loadTheme(themePath);
+        var theme = themeRec.colors;
+        var txStylesEl = elChild(mDoc.documentElement, 'txStyles');
+        var txStyles = {
+          title: parseLevelStyles(txStylesEl && elChild(txStylesEl, 'titleStyle'), theme),
+          body: parseLevelStyles(txStylesEl && elChild(txStylesEl, 'bodyStyle'), theme),
+          other: parseLevelStyles(txStylesEl && elChild(txStylesEl, 'otherStyle'), theme)
+        };
+        var master = { theme: theme, lnWidths: themeRec.lnWidths, txStyles: txStyles, bg: bgOfDoc(mDoc, theme), phShapes: [] };
+        var mCSld = elChild(mDoc.documentElement, 'cSld');
+        var mSpTree = mCSld && elChild(mCSld, 'spTree');
+        if (mSpTree) {
+          var mKids = mSpTree.childNodes || [];
+          for (var pi = 0; pi < mKids.length; pi++) {
+            var mEl = mKids[pi];
+            if (mEl.nodeType === 1 && localNameOf(mEl) === 'sp' && phInfoOf(mEl)) master.phShapes.push(mEl);
+          }
+        }
+        masters.push(master);
+        elDescendants(mDoc.documentElement, 'sldLayoutId').forEach(function (idEl) {
+          var target = mRels[relAttr(idEl, 'id')];
+          if (target) layoutByPath[resolveTarget(mDir, target)] = master;
+        });
+      }
+    } catch (e) { /* masters/layouts are best-effort; slides still parse */ }
+    var layoutDocCache = {};
+    async function layoutPlaceholders(layoutPath) {
+      if (layoutDocCache[layoutPath]) return layoutDocCache[layoutPath];
+      var rec = { shapes: [], bg: null };
+      try {
+        var f = zip.file(layoutPath);
+        if (f) {
+          var doc = xmlDoc(await f.async('text'));
+          var master = layoutByPath[layoutPath];
+          rec.bg = master ? bgOfDoc(doc, master.theme) : null;
+          var cSld = elChild(doc.documentElement, 'cSld');
+          var spTree = cSld && elChild(cSld, 'spTree');
+          if (spTree) {
+            var kids = spTree.childNodes || [];
+            for (var i = 0; i < kids.length; i++) {
+              var el = kids[i];
+              if (el.nodeType === 1 && localNameOf(el) === 'sp' && phInfoOf(el)) rec.shapes.push(el);
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+      layoutDocCache[layoutPath] = rec;
+      return rec;
+    }
     for (var i = 0; i < order.length; i++) {
       var path = order[i];
       var file = zip.file(path);
@@ -2410,7 +3514,29 @@
       var slideRels = {};
       var relsPath = dir + '/_rels/' + path.split('/').pop() + '.rels';
       if (zip.file(relsPath)) slideRels = parseRels(await zip.file(relsPath).async('text'));
-      var slide = parseSlideDoc(xmlDoc(await file.async('text')), slideRels, dir);
+      /* Resolve this slide's layout (and through it, its master/theme). */
+      var ctx = null;
+      var layoutPath = null;
+      Object.keys(slideRels).forEach(function (rid) {
+        var t = slideRels[rid];
+        if (/slideLayouts\/slideLayout\d+\.xml$/.test(t)) layoutPath = resolveTarget(dir, t);
+      });
+      var master = (layoutPath && layoutByPath[layoutPath]) || masters[0] || null;
+      var layoutRec = layoutPath ? await layoutPlaceholders(layoutPath) : null;
+      if (master || layoutRec) {
+        var phShapes = layoutRec ? layoutRec.shapes : [];
+        var masterPhShapes = master ? master.phShapes : [];
+        ctx = {
+          theme: master ? master.theme : {},
+          lnWidths: master ? master.lnWidths : [0.75, 1.5, 2.25],
+          txStyles: master ? master.txStyles : null,
+          layoutBg: layoutRec ? layoutRec.bg : null,
+          masterBg: master ? master.bg : null,
+          findLayoutPh: function (type, idx) { return matchPhShape(phShapes, type, idx); },
+          findMasterPh: function (type, idx) { return matchPhShape(masterPhShapes, type, idx); }
+        };
+      }
+      var slide = parseSlideDoc(xmlDoc(await file.async('text')), slideRels, dir, ctx);
       for (var j = 0; j < slide.shapes.length; j++) {
         var sh = slide.shapes[j];
         if (sh.kind === 'unsupported') { skipped++; continue; }
@@ -2435,6 +3561,23 @@
                 sh.dataUrl = cv.toDataURL('image/png');
                 sh.imgFormat = 'PNG';
               } catch (e) { /* leave the picture out */ }
+            }
+            /* srcRect crop: redraw only the visible region. */
+            if (sh.crop && sh.dataUrl && typeof document !== 'undefined') {
+              try {
+                var cimg = await loadImage(sh.dataUrl);
+                var sx = Math.round(sh.crop.l * cimg.naturalWidth);
+                var sy = Math.round(sh.crop.t * cimg.naturalHeight);
+                var sw = Math.round((1 - sh.crop.l - sh.crop.r) * cimg.naturalWidth);
+                var shh = Math.round((1 - sh.crop.t - sh.crop.b) * cimg.naturalHeight);
+                if (sw > 0 && shh > 0) {
+                  var ccv = document.createElement('canvas');
+                  ccv.width = sw; ccv.height = shh;
+                  ccv.getContext('2d').drawImage(cimg, sx, sy, sw, shh, 0, 0, sw, shh);
+                  sh.dataUrl = ccv.toDataURL('image/png');
+                  sh.imgFormat = 'PNG';
+                }
+              } catch (e) { /* keep the uncropped picture */ }
             }
           }
         }
@@ -2477,7 +3620,7 @@
       cur.forEach(function (wd) {
         var last = runs[runs.length - 1];
         if (last && last.src === wd.run) last.text += wd.text;
-        else runs.push({ text: wd.text, size: wd.run.size, bold: wd.run.bold, italic: wd.run.italic, color: wd.run.color, font: wd.run.font, src: wd.run });
+        else runs.push({ text: wd.text, size: wd.run.size, bold: wd.run.bold, italic: wd.run.italic, underline: wd.run.underline, color: wd.run.color, font: wd.run.font, src: wd.run });
       });
       runs.forEach(function (r) { delete r.src; });
       lines.push({ runs: runs, align: align, size: maxRunSize(runs) });
@@ -2492,11 +3635,60 @@
     });
     flush();
   }
-  function drawShapeGeometry(doc, box, geom, fill, line) {
+  var GEOM_POINTS = {
+    triangle: [[0.5, 0], [1, 1], [0, 1]],
+    isoscelesTriangle: [[0.5, 0], [1, 1], [0, 1]],
+    diamond: [[0.5, 0], [1, 0.5], [0.5, 1], [0, 0.5]],
+    parallelogram: [[0.28, 0], [1, 0], [0.72, 1], [0, 1]],
+    trapezoid: [[0.2, 0], [0.8, 0], [1, 1], [0, 1]],
+    chevron: [[0, 0], [0.6, 0], [1, 0.5], [0.6, 1], [0, 1], [0.4, 0.5]],
+    pentagon: [[0, 0.4], [0.5, 0], [1, 0.4], [1, 1], [0, 1]],
+    homePlate: [[0, 0.4], [0.5, 0], [1, 0.4], [1, 1], [0, 1]],
+    rightTriangle: [[0, 0], [1, 1], [0, 1]],
+    hexagon: [[0.25, 0], [0.75, 0], [1, 0.5], [0.75, 1], [0.25, 1], [0, 0.5]],
+    octagon: [[0.3, 0], [0.7, 0], [1, 0.3], [1, 0.7], [0.7, 1], [0.3, 1], [0, 0.7], [0, 0.3]]
+  };
+  /* Rotate a point about a centre by rad radians, clockwise in
+     screen coordinates (y grows downward), matching OOXML rot. */
+  function rotPt(x, y, cx, cy, rad) {
+    var dx = x - cx, dy = y - cy;
+    var c = Math.cos(rad), s = Math.sin(rad);
+    return { x: cx + dx * c - dy * s, y: cy + dx * s + dy * c };
+  }
+  function drawPolygon(doc, pts, style) {
+    if (typeof doc.moveTo !== 'function' || typeof doc.lineTo !== 'function') return false;
+    doc.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < pts.length; i++) doc.lineTo(pts[i].x, pts[i].y);
+    doc.close();
+    if (style === 'FD') doc.fillStroke();
+    else if (style === 'F') doc.fill();
+    else doc.stroke();
+    return true;
+  }
+  function drawShapeGeometry(doc, box, geom, fill, line, rotDeg) {
     var style = (fill && line) ? 'FD' : (fill ? 'F' : (line ? 'D' : null));
     if (!style) return;
     if (fill) doc.setFillColor(fill.r, fill.g, fill.b);
     if (line) { doc.setDrawColor(line.color.r, line.color.g, line.color.b); doc.setLineWidth(line.width); }
+    var rad = (rotDeg || 0) * Math.PI / 180;
+    var cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+    var pts = GEOM_POINTS[geom];
+    if (pts) {
+      var abs = pts.map(function (p) {
+        var x = box.x + p[0] * box.w, y = box.y + p[1] * box.h;
+        return rad ? rotPt(x, y, cx, cy, rad) : { x: x, y: y };
+      });
+      if (drawPolygon(doc, abs, style)) return;
+    }
+    if (rad && geom !== 'ellipse') {
+      /* Rotated rect / roundRect: draw as a rotated polygon (corners
+         lose their rounding when rotated — an acceptable trade). */
+      var corners = [
+        rotPt(box.x, box.y, cx, cy, rad), rotPt(box.x + box.w, box.y, cx, cy, rad),
+        rotPt(box.x + box.w, box.y + box.h, cx, cy, rad), rotPt(box.x, box.y + box.h, cx, cy, rad)
+      ];
+      if (drawPolygon(doc, corners, style)) return;
+    }
     if (geom === 'ellipse') {
       doc.ellipse(box.x + box.w / 2, box.y + box.h / 2, box.w / 2, box.h / 2, style);
     } else if (geom === 'roundRect' || geom === 'roundSameRect' || geom === 'round1Rect' || geom === 'round2DiagRect' || geom === 'round2SameRect') {
@@ -2508,6 +3700,38 @@
       doc.rect(box.x, box.y, box.w, box.h, style);
     }
   }
+  function alphaNum(n) {
+    var s = '';
+    while (n > 0) { var m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+    return s || 'A';
+  }
+  function romanNum(n) {
+    if (n <= 0) return 'i';
+    var table = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+    var s = '';
+    table.forEach(function (pair) { while (n >= pair[0]) { s += pair[1]; n -= pair[0]; } });
+    return s;
+  }
+  function formatAutoNum(type, n) {
+    switch (type) {
+      case 'arabicParenR': return n + ')';
+      case 'arabicParenBoth': return '(' + n + ')';
+      case 'arabicPlain': return String(n);
+      case 'alphaLcPeriod': return alphaNum(n).toLowerCase() + '.';
+      case 'alphaLcParenR': return alphaNum(n).toLowerCase() + ')';
+      case 'alphaLcParenBoth': return '(' + alphaNum(n).toLowerCase() + ')';
+      case 'alphaUcPeriod': return alphaNum(n) + '.';
+      case 'alphaUcParenR': return alphaNum(n) + ')';
+      case 'alphaUcParenBoth': return '(' + alphaNum(n) + ')';
+      case 'romanLcPeriod': return romanNum(n).toLowerCase() + '.';
+      case 'romanLcParenR': return romanNum(n).toLowerCase() + ')';
+      case 'romanLcParenBoth': return '(' + romanNum(n).toLowerCase() + ')';
+      case 'romanUcPeriod': return romanNum(n) + '.';
+      case 'romanUcParenR': return romanNum(n) + ')';
+      case 'romanUcParenBoth': return '(' + romanNum(n) + ')';
+      default: return n + '.';
+    }
+  }
   function renderTableShape(doc, sh) {
     var box = sh.box;
     var x = box.x, y = box.y;
@@ -2516,76 +3740,186 @@
     var totalW = colX[colX.length - 1] - x;
     if (totalW <= 0) return;
     var rowH = sh.rows.map(function (r) { return r.h > 0 ? r.h : 20; });
+    var rowY = [y];
+    rowH.forEach(function (rh) { rowY.push(rowY[rowY.length - 1] + rh); });
     sh.rows.forEach(function (row, ri) {
-      var rh = rowH[ri];
-      var cx = x;
-      row.cells.forEach(function (cell, ci) {
-        var span = Math.max(1, cell.span || 1);
+      row.cells.forEach(function (cell) {
+        if (cell.vMerge || cell.hMerge) return; /* covered by the spanning cell */
+        var gi = Math.min(cell.gridIdx, sh.grid.length - 1);
+        var cx = colX[gi];
         var cw = 0;
-        for (var s = 0; s < span && ci + s < sh.grid.length; s++) cw += sh.grid[ci + s];
+        for (var s = 0; s < cell.span && gi + s < sh.grid.length; s++) cw += sh.grid[gi + s];
         if (cw <= 0) cw = totalW / row.cells.length;
-        var fill = cell.fill || (sh.firstRow && ri === 0 ? { r: 217, g: 226, b: 243 } : null);
-        if (fill) { doc.setFillColor(fill.r, fill.g, fill.b); doc.rect(cx, y, cw, rh, 'F'); }
-        doc.setDrawColor(160, 160, 160); doc.setLineWidth(0.5); doc.rect(cx, y, cw, rh, 'D');
-        if (cell.text) {
-          var size = cell.size || 12;
-          doc.setFont('helvetica', cell.bold || (sh.firstRow && ri === 0) ? 'bold' : 'normal');
-          doc.setFontSize(size);
-          if (cell.color) doc.setTextColor(cell.color.r, cell.color.g, cell.color.b); else doc.setTextColor(0, 0, 0);
-          var pad = 6;
-          var lines = doc.splitTextToSize(cell.text, Math.max(10, cw - pad * 2));
-          var lh = size * 1.25;
-          var ty = y + pad + size * 0.8;
-          var maxLines = Math.max(1, Math.floor((rh - pad) / lh));
-          lines.slice(0, maxLines).forEach(function (ln, li) {
-            var tx = cx + pad;
-            if (cell.align === 'center') tx = cx + cw / 2 - doc.getTextWidth(ln) / 2;
-            else if (cell.align === 'right') tx = cx + cw - pad - doc.getTextWidth(ln);
-            doc.text(ln, tx, ty + li * lh);
+        var rh = 0;
+        for (var rs = 0; rs < cell.rowSpan && ri + rs < rowH.length; rs++) rh += rowH[ri + rs];
+        var cy = rowY[ri];
+        /* Only the cell's own explicit fill is drawn. Table-style fills
+           (header colour, banded rows) live in the application, not the
+           file, so they are not invented here. */
+        if (cell.fill) { doc.setFillColor(cell.fill.r, cell.fill.g, cell.fill.b); doc.rect(cx, cy, cw, rh, 'F'); }
+        doc.setDrawColor(160, 160, 160); doc.setLineWidth(0.5); doc.rect(cx, cy, cw, rh, 'D');
+        var m = cell.margins;
+        var tx0 = cx + m.l, ty0 = cy + m.t;
+        var tw = Math.max(10, cw - m.l - m.r);
+        var th = Math.max(10, rh - m.t - m.b);
+        var lines = [];
+        (cell.paras || []).forEach(function (para) {
+          var segments = [[]];
+          para.runs.forEach(function (r) {
+            if (r.br) segments.push([]);
+            else segments[segments.length - 1].push(r);
           });
-        }
-        cx += cw;
+          segments.forEach(function (seg) {
+            if (!seg.length) { lines.push({ runs: [], align: para.align, size: 12 }); return; }
+            wrapRuns(doc, seg, tw, true, para.align, lines);
+          });
+        });
+        var totalH = 0;
+        lines.forEach(function (l) { totalH += l.size * 1.2; });
+        var ly = ty0;
+        if (cell.anchor === 'ctr') ly = ty0 + Math.max(0, (th - totalH) / 2);
+        else if (cell.anchor === 'b') ly = ty0 + Math.max(0, th - totalH);
+        lines.forEach(function (line) {
+          var baseline = ly + line.size * 0.85;
+          var lineW = 0;
+          line.runs.forEach(function (r) { setRunFont(doc, r); lineW += doc.getTextWidth(r.text); });
+          var rx = tx0;
+          if (line.align === 'center') rx = tx0 + (tw - lineW) / 2;
+          else if (line.align === 'right') rx = tx0 + tw - lineW;
+          line.runs.forEach(function (r) {
+            setRunFont(doc, r);
+            if (r.color) doc.setTextColor(r.color.r, r.color.g, r.color.b); else doc.setTextColor(0, 0, 0);
+            doc.text(r.text, rx, baseline);
+            if (r.underline) {
+              var rw = doc.getTextWidth(r.text);
+              doc.setDrawColor(r.color ? r.color.r : 0, r.color ? r.color.g : 0, r.color ? r.color.b : 0);
+              doc.setLineWidth(Math.max(0.5, r.size / 24));
+              doc.line(rx, baseline + r.size * 0.12, rx + rw, baseline + r.size * 0.12);
+            }
+            rx += doc.getTextWidth(r.text);
+          });
+          ly += line.size * 1.2;
+        });
       });
-      y += rh;
     });
   }
   function renderTextShape(doc, sh) {
     var box = sh.box;
-    drawShapeGeometry(doc, box, sh.geom || 'rect', sh.fill, sh.line);
+    var rot = sh.rot || 0;
     var x0 = box.x + sh.insets.l, y0 = box.y + sh.insets.t;
     var w = Math.max(10, box.w - sh.insets.l - sh.insets.r);
     var h = Math.max(10, box.h - sh.insets.t - sh.insets.b);
+    var counters = {};
     var lines = [];
     sh.paras.forEach(function (para) {
+      var paraSize = 18;
+      para.runs.forEach(function (r) { if (r.size && r.size > paraSize) paraSize = r.size; });
+      var marL = Math.max(0, para.marL || 0);
+      var bulletX = Math.max(0, marL + (para.indent || 0));
+      var bulletText = null;
+      if (para.bullet && para.bullet.type === 'char') bulletText = para.bullet.char;
+      else if (para.bullet && para.bullet.type === 'autoNum') {
+        var lvl = para.level || 0;
+        counters[lvl] = (counters[lvl] || 0) + 1;
+        for (var L = lvl + 1; L < 9; L++) counters[L] = 0;
+        bulletText = formatAutoNum(para.bullet.numType, counters[lvl] + (para.bullet.startAt || 1) - 1);
+      }
       var segments = [[]];
       para.runs.forEach(function (r) {
         if (r.br) segments.push([]);
         else segments[segments.length - 1].push(r);
       });
+      var paraLines = [];
       segments.forEach(function (seg) {
-        if (!seg.length) { lines.push({ runs: [], align: para.align, size: 18 }); return; }
-        wrapRuns(doc, seg, w, sh.wrap, para.align, lines);
+        if (!seg.length) { paraLines.push({ runs: [], align: para.align, size: paraSize }); return; }
+        wrapRuns(doc, seg, Math.max(10, w - marL), sh.wrap, para.align, paraLines);
+      });
+      var lnSpc = para.lnSpc;
+      var sb = para.spcBef ? (para.spcBef.pts !== undefined ? para.spcBef.pts : para.spcBef.pct * paraSize) : 0;
+      var sa = para.spcAft ? (para.spcAft.pts !== undefined ? para.spcAft.pts : para.spcAft.pct * paraSize) : 0;
+      paraLines.forEach(function (l, li) {
+        l.h = lnSpc ? (lnSpc.pts !== undefined ? lnSpc.pts : l.size * 1.2 * lnSpc.pct) : l.size * 1.2;
+        l.xOff = marL;
+        l.sb = li === 0 ? sb : 0;
+        l.sa = li === paraLines.length - 1 ? sa : 0;
+        if (li === 0 && bulletText) { l.bullet = bulletText; l.bulletX = bulletX; }
+        lines.push(l);
       });
     });
     var totalH = 0;
-    lines.forEach(function (l) { totalH += l.size * 1.2; });
+    lines.forEach(function (l) { totalH += l.sb + l.h + l.sa; });
+    if (sh.autoFit) {
+      /* <a:spAutoFit/>: the shape resizes to fit its text. Height always
+         shrinks/grows to the content; width too when wrapping is off.
+         The top-left corner is kept (bottom/centre-anchored shapes keep
+         their bottom/centre edge instead). */
+      var newH = totalH + sh.insets.t + sh.insets.b;
+      var newW = box.w;
+      if (!sh.wrap) {
+        var maxW = 0;
+        lines.forEach(function (l) {
+          var lw = l.xOff || 0;
+          l.runs.forEach(function (r) { setRunFont(doc, r); lw += doc.getTextWidth(r.text); });
+          if (l.bullet) {
+            var br = l.runs[0] || { size: l.size, bold: false, italic: false, font: '' };
+            setRunFont(doc, br);
+            lw = Math.max(lw, (l.bulletX || 0) + doc.getTextWidth(l.bullet + ' '));
+          }
+          if (lw > maxW) maxW = lw;
+        });
+        newW = maxW + sh.insets.l + sh.insets.r;
+      }
+      var newBox = { x: box.x, y: box.y, w: Math.max(10, newW), h: Math.max(10, newH) };
+      if (sh.anchor === 'b') newBox.y = box.y + box.h - newBox.h;
+      else if (sh.anchor === 'ctr') newBox.y = box.y + (box.h - newBox.h) / 2;
+      box = newBox;
+      x0 = box.x + sh.insets.l; y0 = box.y + sh.insets.t;
+      w = Math.max(10, box.w - sh.insets.l - sh.insets.r);
+      h = Math.max(10, box.h - sh.insets.t - sh.insets.b);
+    }
+    drawShapeGeometry(doc, box, sh.geom || 'rect', sh.fill, sh.line, rot);
     var y = y0;
     if (sh.anchor === 'ctr') y = y0 + Math.max(0, (h - totalH) / 2);
     else if (sh.anchor === 'b') y = y0 + Math.max(0, h - totalH);
+    var rad = rot * Math.PI / 180;
+    var cx = box.x + box.w / 2, cy = box.y + box.h / 2;
+    function place(x, yy) { return rad ? rotPt(x, yy, cx, cy, rad) : { x: x, y: yy }; }
     lines.forEach(function (line) {
+      y += line.sb;
       var baseline = y + line.size * 0.85;
       var lineW = 0;
       line.runs.forEach(function (r) { setRunFont(doc, r); lineW += doc.getTextWidth(r.text); });
-      var rx = x0;
-      if (line.align === 'center') rx = x0 + (w - lineW) / 2;
-      else if (line.align === 'right') rx = x0 + w - lineW;
+      var colW = Math.max(10, w - line.xOff);
+      var rx = x0 + line.xOff;
+      if (line.align === 'center') rx = x0 + line.xOff + (colW - lineW) / 2;
+      else if (line.align === 'right') rx = x0 + line.xOff + colW - lineW;
+      if (line.bullet) {
+        var bRun = line.runs[0] || { size: line.size, bold: false, italic: false, color: null, font: '' };
+        setRunFont(doc, bRun);
+        if (bRun.color) doc.setTextColor(bRun.color.r, bRun.color.g, bRun.color.b); else doc.setTextColor(0, 0, 0);
+        var bp = place(x0 + line.bulletX, baseline);
+        if (rad) doc.text(line.bullet, bp.x, bp.y, { angle: -rot });
+        else doc.text(line.bullet, bp.x, bp.y);
+      }
       line.runs.forEach(function (r) {
         setRunFont(doc, r);
         if (r.color) doc.setTextColor(r.color.r, r.color.g, r.color.b); else doc.setTextColor(0, 0, 0);
-        doc.text(r.text, rx, baseline);
-        rx += doc.getTextWidth(r.text);
+        var rp = place(rx, baseline);
+        var rw = doc.getTextWidth(r.text);
+        if (rad) doc.text(r.text, rp.x, rp.y, { angle: -rot });
+        else doc.text(r.text, rp.x, rp.y);
+        if (r.underline) {
+          doc.setDrawColor(r.color ? r.color.r : 0, r.color ? r.color.g : 0, r.color ? r.color.b : 0);
+          doc.setLineWidth(Math.max(0.5, r.size / 24));
+          var u1 = place(rx, baseline + r.size * 0.12);
+          var u2 = rad
+            ? { x: u1.x + rw * Math.cos(rad), y: u1.y + rw * Math.sin(rad) }
+            : { x: rx + rw, y: baseline + r.size * 0.12 };
+          doc.line(u1.x, u1.y, u2.x, u2.y);
+        }
+        rx += rw;
       });
-      y += line.size * 1.2;
+      y += line.h + line.sa;
     });
   }
   async function toolPptxToPdf(files, opts, prog) {
@@ -2696,9 +4030,13 @@
       boxesFromTextItems: boxesFromTextItems,
       layoutLinesFromBoxes: layoutLinesFromBoxes,
       buildLayoutDocxXml: buildLayoutDocxXml,
+      lineRunsXml: lineRunsXml,
+      showTextString: showTextString,
       letterSpacingPts: letterSpacingPts,
       fitLineBoxes: fitLineBoxes,
       parsePptx: parsePptx,
+      parseDocxStructure: parseDocxStructure,
+      placeFloatingDrawings: placeFloatingDrawings,
       interpretPdfOps: interpretPdfOps,
       isNoiseLine: isNoiseLine,
       excelRowsFromPage: excelRowsFromPage,
