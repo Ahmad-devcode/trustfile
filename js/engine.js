@@ -413,6 +413,15 @@
       }
     });
   }
+  /* Symbol/OpenSymbol list markers (LibreOffice bullets) arrive from
+     pdf.js as private-use characters (U+F0B7) that render as empty
+     boxes in Word and PowerPoint with ordinary fonts — the font table
+     reports them as "monospace", so the character itself is the only
+     reliable signal. Map the known bullet code points to a real
+     bullet; every other character passes through untouched. */
+  function normalizePdfText(str) {
+    return String(str || '').replace(/[\uF0B7\uF0A7]/g, '\u2022');
+  }
   function boxesFromTextItems(items, pageHeight, styles) {
     var ph = pageHeight;
     if (!ph) {
@@ -431,7 +440,7 @@
       var styleInfo = (styles && styles[it.fontName]) || {};
       var fontLabel = String(styleInfo.fontFamily || '') + ' ' + String(it.fontName || '');
       return {
-        text: String(it.str || ''),
+        text: normalizePdfText(it.str),
         x0: x0, x1: x0 + itemWidth(it),
         y1: ph - yBottom,
         y0: ph - yBottom - size,
@@ -933,7 +942,7 @@
      font a little until it fits on one line — never more than 20%
      smaller, and only when it actually overflows its column. Returns a
      parallel array of { w, h, size, wraps }. */
-  function fitLineBoxes(lines, pageWidth) {
+  function fitLineBoxes(lines, pageWidth, graphics) {
     return lines.map(function (line) {
       var x = Math.max(0, Math.min(line.x, pageWidth - 20));
       var rightLimit = pageWidth;
@@ -943,6 +952,32 @@
         var minH = Math.min(line.size, other.size);
         if (yOverlap > minH * 0.3) rightLimit = Math.min(rightLimit, other.x - 4);
       });
+      /* Table borders and panel edges are graphic boundaries: a line
+         inside a table cell must not grow past the cell's right border
+         just because no other text box sits to its right (the old code
+         let table text spill across the border). Clamp to the nearest
+         vertical graphic edge that overlaps this line's band: stroked
+         segments at least a line tall (table grid lines), and tall
+         rectangle edges (cell/panel borders). Short rules, highlights
+         and chips are excluded by the height guards, and images are
+         never boundaries — text legitimately sits on top of photos. */
+      if (graphics) {
+        var bandTop = line.y, bandBot = line.y + line.size;
+        function edgeClamp(edgeX, top, bot) {
+          if (edgeX <= x + 4) return;
+          var overlap = Math.min(bandBot, bot) - Math.max(bandTop, top);
+          if (overlap >= line.size * 0.5) rightLimit = Math.min(rightLimit, edgeX - 2);
+        }
+        (graphics.lines || []).forEach(function (ln) {
+          if (ln.h > ln.w * 3 && ln.h >= line.size) edgeClamp(ln.x + ln.w / 2, ln.y, ln.y + ln.h);
+        });
+        (graphics.rects || []).forEach(function (r) {
+          if (r.h >= line.size * 2) {
+            edgeClamp(r.x, r.y, r.y + r.h);
+            edgeClamp(r.x + r.w, r.y, r.y + r.h);
+          }
+        });
+      }
       var size = line.size;
       var estW = estTextWidthPt(line.text, size);
       var avail = Math.max(20, Math.min(pageWidth - x - 2, rightLimit - x));
@@ -1091,7 +1126,7 @@
           }
         });
       }
-      var fitted = fitLineBoxes(pg.lines, pg.width);
+      var fitted = fitLineBoxes(pg.lines, pg.width, pg.isOcr ? null : g);
       pg.lines.forEach(function (line, li) {
         shapeId++;
         /* Never spread OCR lines: OCR word boxes already carry the visual
@@ -1933,7 +1968,7 @@
             } catch (e) { /* skip */ }
           });
         }
-        var fitted = fitLineBoxes(pg.lines, pg.width);
+        var fitted = fitLineBoxes(pg.lines, pg.width, pg.isOcr ? null : g);
         pg.lines.forEach(function (line, li) {
           var spacing = pg.isOcr ? 0 : letterSpacingPts(line);
           var box = {
