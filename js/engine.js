@@ -135,6 +135,11 @@
   function baseOf(name) {
     return String(name || 'file').replace(/\.[^.]+$/, '') || 'file';
   }
+  function fmtSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / 1048576).toFixed(2) + ' MB';
+  }
   function escapeXml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
@@ -257,6 +262,84 @@
     name = name.split(/[-,]/)[0].trim();
     return /^[A-Za-z][A-Za-z0-9 ]*$/.test(name) ? name : '';
   }
+  /* ---- Letter-spaced heading repair (Canva-style PDFs) ----
+     Canva emits headings glyph-by-glyph (one showText per glyph, with
+     moveText advances), including REAL space glyphs at word boundaries.
+     pdf.js getTextContent collapses that into one item with a uniform
+     space between every glyph ("S A L E ' S M A N ..."), erasing word
+     boundaries. The operator list still carries the true glyph stream,
+     so for items that are all single characters we match them against
+     the glyph blocks and restore the real words — plus the per-gap
+     letter-spacing, recovered from the item width minus the true glyph
+     advances, so the heading still renders spread out. */
+  function despaceKey(s) {
+    return String(s || '').replace(/[\s\u200B-\u200D\uFEFF]+/g, '');
+  }
+  function glyphBlocksFromOps(fnArray, argsArray, OPS) {
+    var blocks = [];
+    var cur = null;
+    function flush() { if (cur && cur.glyphs.length) blocks.push(cur); cur = null; }
+    /* The text-showing op carrying the string differs per op
+       (showText: args[0]; nextLineSetSpacingShowText: args[2]). */
+    function textArg(args) {
+      for (var i = 0; i < args.length; i++) {
+        if (typeof args[i] === 'string' || (args[i] && args[i].length !== undefined)) return args[i];
+      }
+      return null;
+    }
+    for (var i = 0; i < fnArray.length; i++) {
+      var fn = fnArray[i], args = argsArray[i] || [];
+      if (fn === OPS.beginText || fn === OPS.setTextMatrix || fn === OPS.setTextLineMatrix) { flush(); cur = { glyphs: [] }; }
+      else if (fn === OPS.endText) { flush(); }
+      else if (fn === OPS.showText || fn === OPS.showSpacedText || fn === OPS.nextLineShowText || fn === OPS.nextLineSetSpacingShowText) {
+        if (!cur) cur = { glyphs: [] };
+        var arr = textArg(args);
+        if (typeof arr === 'string') {
+          for (var s = 0; s < arr.length; s++) cur.glyphs.push({ ch: arr[s], w: 0 });
+        } else if (arr) {
+          for (var g = 0; g < arr.length; g++) {
+            var el = arr[g];
+            if (typeof el === 'string') {
+              for (var k = 0; k < el.length; k++) cur.glyphs.push({ ch: el[k], w: 0 });
+            } else if (el && typeof el === 'object' && typeof el.unicode === 'string') {
+              cur.glyphs.push({ ch: el.unicode, w: parseFloat(el.width) || 0 });
+            }
+            /* Numbers in a TJ array are kerning adjustments — ignored:
+               word boundaries come from the space glyphs themselves. */
+          }
+        }
+      }
+    }
+    flush();
+    return blocks.map(function (b) {
+      var text = b.glyphs.map(function (g) { return g.ch; }).join('');
+      var widthSum = 0, haveWidths = true;
+      b.glyphs.forEach(function (g) { if (!g.w) haveWidths = false; widthSum += g.w; });
+      return { text: text, key: despaceKey(text), widthSum: widthSum, haveWidths: haveWidths, glyphs: b.glyphs.length };
+    }).filter(function (b) { return b.key !== ''; });
+  }
+  async function repairSpacedItems(page, items) {
+    var opList = await page.getOperatorList();
+    var blocks = glyphBlocksFromOps(opList.fnArray, opList.argsArray, global.pdfjsLib.OPS);
+    var byKey = {};
+    blocks.forEach(function (b) { if (!byKey[b.key]) byKey[b.key] = b; });
+    items.forEach(function (it) {
+      var str = String(it.str || '');
+      if (!isAlreadySpaced(str)) return;
+      var block = byKey[despaceKey(str)];
+      /* Only repair when the glyph stream carries REAL word spaces —
+         a spaceless block means the producer gave no word boundaries,
+         and the uniform-spread rendering is the honest fallback. */
+      if (!block || block.text.indexOf(' ') === -1 || block.text === str) return;
+      it.str = block.text;
+      if (block.haveWidths && typeof it.width === 'number' && it.width > 0 && block.glyphs > 1) {
+        var size = Math.abs(it.transform[3]) || Math.abs(it.transform[0]) || 10;
+        var advance = block.widthSum / 1000 * size;
+        var spacing = (it.width - advance) / (block.glyphs - 1);
+        if (spacing > 0 && isFinite(spacing)) it._spacing = Math.min(8, spacing);
+      }
+    });
+  }
   function boxesFromTextItems(items, pageHeight, styles) {
     var ph = pageHeight;
     if (!ph) {
@@ -282,7 +365,8 @@
         size: size,
         bold: /bold/i.test(fontLabel),
         italic: /italic|oblique/i.test(fontLabel),
-        font: cleanFontName(styleInfo.fontFamily || it.fontName)
+        font: cleanFontName(styleInfo.fontFamily || it.fontName),
+        spacing: it._spacing || 0 /* letter-spacing recovered from the glyph stream, if any */
       };
     }).filter(function (b) { return b.text.trim() !== ''; }));
   }
@@ -440,6 +524,109 @@
     if (!items || !items.length) return [];
     return xyCut(boxesFromTextItems(items, pageHeight), 0);
   }
+  /* ---- Table rows for PDF to Excel ----
+     XY-cut reading order is right for prose but destroys tables: it
+     splits a table's columns apart and emits them column-major. For a
+     spreadsheet, group boxes into rows by shared baseline and split
+     each row into cells where the horizontal gap is wide — but only
+     when the page actually looks like a grid (column starts that line
+     up across rows, and a consistent cell count). Prose and
+     free-flowing two-column layouts fall back to XY-cut reading order,
+     so resumes never regress. */
+  function groupRowsByBaseline(boxes) {
+    var sorted = boxes.slice().sort(function (a, b) { return (a.y0 - b.y0) || (a.x0 - b.x0); });
+    var rows = [];
+    sorted.forEach(function (b) {
+      var row = null;
+      for (var i = rows.length - 1; i >= 0; i--) {
+        var r = rows[i];
+        var yOverlap = Math.min(b.y1, r.y1) - Math.max(b.y0, r.y0);
+        var minH = Math.min(b.y1 - b.y0, r.y1 - r.y0);
+        if (yOverlap > minH * 0.4) { row = r; break; }
+      }
+      if (row) {
+        row.boxes.push(b);
+        row.x0 = Math.min(row.x0, b.x0); row.x1 = Math.max(row.x1, b.x1);
+        row.y0 = Math.min(row.y0, b.y0); row.y1 = Math.max(row.y1, b.y1);
+      } else {
+        rows.push({ x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1, boxes: [b] });
+      }
+    });
+    return rows;
+  }
+  /* Split one baseline row into cells on wide x-gaps. Returns
+     { cells: [text], starts: [x0 of each cell] }. */
+  function splitRowCells(rowBoxes, gapThreshold) {
+    var words = rowBoxes.slice().sort(function (a, b) { return a.x0 - b.x0; });
+    var groups = [[words[0]]];
+    for (var i = 1; i < words.length; i++) {
+      if (words[i].x0 - words[i - 1].x1 > gapThreshold) groups.push([words[i]]);
+      else groups[groups.length - 1].push(words[i]);
+    }
+    return {
+      cells: groups.map(function (g) {
+        return g.map(function (b) { return b.text; }).join(' ').replace(/\s+/g, ' ').trim();
+      }),
+      starts: groups.map(function (g) { return g[0].x0; })
+    };
+  }
+  /* Cluster x-starts within `tol` points; returns cluster sizes. */
+  function clusterStarts(starts, tol) {
+    var sorted = starts.slice().sort(function (a, b) { return a - b; });
+    var clusters = [];
+    sorted.forEach(function (x) {
+      var last = clusters[clusters.length - 1];
+      if (last && x - last.anchor <= tol) { last.count++; }
+      else clusters.push({ anchor: x, count: 1 });
+    });
+    return clusters.map(function (c) { return c.count; });
+  }
+  /* Rows for one PDF page in a spreadsheet: a grid when the page looks
+     like a table, otherwise XY-cut reading order (one column). */
+  function excelRowsFromPage(pg) {
+    var boxes = pg.boxes;
+    if (!boxes.length) return pg.fallbackLines.map(function (l) { return [l]; });
+    var medH = medianHeight(boxes) || 10;
+    var gapThreshold = Math.max(6, medH * 0.75);
+    var rows = groupRowsByBaseline(boxes);
+    var split = rows.map(function (r) { return splitRowCells(r.boxes, gapThreshold); });
+    var multi = split.filter(function (s) { return s.cells.length > 1; });
+    /* Grid test, on NON-first column starts only: first-cell starts
+       always cluster at the left margin, which would misread prose as
+       a grid. A real grid has aligned later columns and a consistent
+       cell count; word-by-word prose splits too, but its starts never
+       align and its cell counts vary wildly. */
+    var laterStarts = [];
+    split.forEach(function (s) { for (var i = 1; i < s.starts.length; i++) laterStarts.push(s.starts[i]); });
+    var clusters = clusterStarts(laterStarts, 10);
+    var strongCols = clusters.filter(function (n) { return n >= 3; }).length;
+    var weakCols = clusters.filter(function (n) { return n >= 2; }).length;
+    var counts = {};
+    multi.forEach(function (s) { counts[s.cells.length] = (counts[s.cells.length] || 0) + 1; });
+    var modal = 0, modalN = 0, maxCells = 0;
+    Object.keys(counts).forEach(function (k) { if (counts[k] > modalN) { modalN = counts[k]; modal = parseInt(k, 10); } });
+    multi.forEach(function (s) { maxCells = Math.max(maxCells, s.cells.length); });
+    var modalShare = multi.length ? modalN / multi.length : 0;
+    /* A table's rows share a cell count; word-by-word prose (Canva CVs)
+       splits one line into many cells next to two-cell rows — the
+       max-cells check rejects that shape even when its columns align. */
+    var isGrid = multi.length >= 2 && modal <= 8 && modalShare >= 0.5 && maxCells <= modal + 1 &&
+      (strongCols >= 2 || weakCols >= 2 || (strongCols >= 1 && multi.length >= 3 && multi.length / split.length >= 0.6));
+    if (!isGrid) {
+      var lines = xyCutLines(groupLines(boxes), 0);
+      if (pg.isOcr) lines = cleanOcrLines(lines);
+      return lines.map(function (l) { return [l]; });
+    }
+    var maxCols = Math.max.apply(null, split.map(function (s) { return s.cells.length; }));
+    var out = [];
+    split.forEach(function (s) {
+      if (pg.isOcr && isNoiseLine(s.cells.join(' '))) return;
+      var row = s.cells.slice();
+      while (row.length < maxCols) row.push('');
+      out.push(row);
+    });
+    return out;
+  }
   /* Is this line OCR noise (icon misreads, separator debris)? */
   function isNoiseLine(text) {
     var l = String(text).replace(/\s+/g, ' ').trim();
@@ -473,7 +660,11 @@
       });
       var font = '';
       Object.keys(fonts).forEach(function (f) { if (!font || fonts[f] > fonts[font]) font = f; });
-      return { text: text, x: line.x0, y: line.y0, w: Math.max(10, line.x1 - line.x0), size: size || 11, bold: bold, italic: italic, font: font };
+      /* Letter-spacing recovered from the glyph stream belongs to one
+         box (a heading); only carry it when the line is that one box,
+         so a repaired heading never spreads its neighbours. */
+      var spacing = words.length === 1 ? (words[0].spacing || 0) : 0;
+      return { text: text, x: line.x0, y: line.y0, w: Math.max(10, line.x1 - line.x0), size: size || 11, bold: bold, italic: italic, font: font, spacing: spacing };
     }).filter(function (l) { return l.text !== '' && (!isOcr || (!isNoiseLine(l.text) && !isFragmentLine(l.text))); });
     /* Headings read bold even when the font name does not say so. */
     var sizes = styled.map(function (l) { return l.size; }).sort(function (a, b) { return a - b; });
@@ -592,6 +783,9 @@
      wider than its text, return the extra spacing per character (points)
      so it can be rendered spread out the way it looked in the PDF. */
   function letterSpacingPts(line) {
+    /* Spacing recovered from the PDF's glyph stream (letter-spaced
+       heading repair) always wins over the width heuristic below. */
+    if (line.spacing && line.spacing > 0) return Math.min(8, line.spacing);
     if (isAlreadySpaced(line.text)) return 0;
     var chars = line.text.replace(/ /g, '').length;
     var expected = estTextWidthPt(line.text, line.size);
@@ -829,6 +1023,13 @@
         var page = await pdf.getPage(p);
         var vp = page.getViewport({ scale: 1 });
         var content = await page.getTextContent();
+        /* Repair Canva-style letter-spaced headings before boxing: the
+           operator list carries the true word boundaries that
+           getTextContent loses. Only runs when a spaced item exists,
+           and failures never block the conversion. */
+        if (content.items.some(function (it) { return it.str && isAlreadySpaced(it.str); })) {
+          try { await repairSpacedItems(page, content.items); } catch (e) { /* keep the original items */ }
+        }
         var boxes = boxesFromTextItems(content.items, vp.height, content.styles);
         var isOcr = false, fallbackLines = [];
         if (!boxes.length) {
@@ -901,7 +1102,9 @@
   function tableHtml(rows, opts) {
     opts = opts || {};
     var maxRows = opts.maxRows || 500;
-    var shown = rows.slice(0, maxRows);
+    /* The header row is rows[0]: show it plus maxRows data rows, so the
+       truncation note counts data rows truthfully. */
+    var shown = rows.slice(0, maxRows + 1);
     var css = '<style>table{border-collapse:collapse;width:100%;font-size:13px}' +
       'th,td{border:1px solid #cbd5e1;padding:7px 9px;text-align:left;vertical-align:top;word-break:break-word}' +
       'th{background:#f1f5f9;font-weight:700}tr:nth-child(even) td{background:#f8fafc}</style>';
@@ -911,8 +1114,8 @@
       html += '<tr>' + shown[i].map(function (c) { return '<td>' + escapeHtml(c) + '</td>'; }).join('') + '</tr>';
     }
     html += '</tbody></table>';
-    if (rows.length > maxRows) {
-      html += '<p style="color:#6b7280;font-size:12px">Showing the first ' + maxRows + ' of ' + rows.length + ' rows.</p>';
+    if (rows.length > maxRows + 1) {
+      html += '<p style="color:#6b7280;font-size:12px">Showing the first ' + maxRows + ' of ' + (rows.length - 1) + ' data rows.</p>';
     }
     return html;
   }
@@ -1069,11 +1272,21 @@
       prog(p / pdf.numPages, 'Compressing page ' + p + ' of ' + pdf.numPages + '...');
     }
     var blob = doc.output('blob');
-    var saved = file.size > 0 ? Math.max(0, Math.round((1 - blob.size / file.size) * 100)) : 0;
-    return {
-      files: [{ name: baseOf(file.name) + '-compressed.pdf', blob: blob }],
-      note: 'New size: ' + (blob.size / 1048576).toFixed(2) + ' MB — about ' + saved + '% smaller than the original.'
-    };
+    var outFiles = [{ name: baseOf(file.name) + '-compressed.pdf', blob: blob }];
+    var note;
+    if (blob.size >= file.size) {
+      /* Re-rendering a mostly-text or already-compact PDF as images can
+         grow the file — say so plainly and include the original, so the
+         user still leaves with the smaller file. */
+      outFiles.push({ name: file.name, blob: file });
+      note = 'The compressed file (' + fmtSize(blob.size) + ') is larger than the original (' + fmtSize(file.size) + ') — this PDF is mostly text or already compact, so re-rendering its pages as images grew it. The original file is included too; keep that one instead.';
+    } else {
+      var saved = Math.round((1 - blob.size / file.size) * 100);
+      note = saved >= 1
+        ? 'New size: ' + fmtSize(blob.size) + ' — about ' + saved + '% smaller than the original (' + fmtSize(file.size) + ').'
+        : 'New size: ' + fmtSize(blob.size) + ' — about the same as the original (' + fmtSize(file.size) + '). This PDF was already compact.';
+    }
+    return { files: outFiles, note: note };
   }
 
   /* ================= Convert FROM pdf (pdf.js) ================= */
@@ -1482,15 +1695,13 @@
   async function toolPdfToExcel(files, opts, prog) {
     needLib('xlsx');
     var file = files[0]; assertSize(file);
-    var result = await pdfPagesText(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
+    var result = await pdfPages(file, function (p, total, label) { prog(p / total * 0.8, label || ('Reading page ' + p + ' of ' + total + '...')); });
     var rows = [];
-    result.pages.forEach(function (lines, idx) {
+    result.pages.forEach(function (pg, idx) {
       if (idx > 0) rows.push([]);
-      lines.forEach(function (line) {
-        rows.push(line.split(/\t| {2,}/).map(function (c) { return c.trim(); }));
-      });
+      excelRowsFromPage(pg).forEach(function (r) { rows.push(r); });
     });
-    if (!rows.length) throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
+    if (!rows.some(function (r) { return r.some(function (c) { return String(c).trim() !== ''; }); })) throw new Error('No readable text was found in this PDF, even after scanning the pages as images. The scan may be too blurry, handwritten, or the text too small to read.');
     var wb = global.XLSX.utils.book_new();
     global.XLSX.utils.book_append_sheet(wb, global.XLSX.utils.aoa_to_sheet(rows), 'PDF Text');
     var arr = global.XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
@@ -2489,7 +2700,12 @@
       fitLineBoxes: fitLineBoxes,
       parsePptx: parsePptx,
       interpretPdfOps: interpretPdfOps,
-      isNoiseLine: isNoiseLine
+      isNoiseLine: isNoiseLine,
+      excelRowsFromPage: excelRowsFromPage,
+      groupRowsByBaseline: groupRowsByBaseline,
+      splitRowCells: splitRowCells,
+      glyphBlocksFromOps: glyphBlocksFromOps,
+      isAlreadySpaced: isAlreadySpaced
     }
   };
   if (typeof module !== 'undefined' && module.exports) {
